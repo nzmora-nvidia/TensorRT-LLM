@@ -447,31 +447,44 @@ def torch_deepseek_prefill_no_absorb_attn(
 
     # kv = c_K * W^UK (i.e. upward projection)
     kv = (
-        torch.einsum("bsc,xc->bsx", compressed_kv, wkv_b)  # [bsz, q_len, 128, 512]
-        .view(bsz, q_len, num_heads, qk_nope_head_dim + v_head_dim)
-        .transpose(1, 2)
+        torch.einsum(
+            "bsc,xc->bsx", compressed_kv, wkv_b
+        )  # [bsz, q_len, 128*512] - [[change this]] new
+        .view(
+            bsz, q_len, num_heads, qk_nope_head_dim + v_head_dim
+        )  # [bsz, q_len, 128, 256] - [[change this]] new
+        .transpose(1, 2)  # [bsz, 128, q_len, 256] - [[change this]] new
     )
 
-    k_nope, value_states = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
+    k_nope, value_states = torch.split(
+        kv, [qk_nope_head_dim, v_head_dim], dim=-1
+    )  # k_nope ~ [bsz, 128, q_len, 128], value_states ~ [bsz, 128, q_len, 128] - [[change this]] new
 
     q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos[:kv_seq_len], sin[:kv_seq_len], position_ids)
 
-    query_states = k_pe.new_empty(bsz, num_heads, q_len, q_head_dim)
+    query_states = k_pe.new_empty(
+        bsz, num_heads, q_len, q_head_dim
+    )  # [bsz, 128, q_len, 192] - [[change this]] new
     query_states[:, :, :, :qk_nope_head_dim] = q_nope
     query_states[:, :, :, qk_nope_head_dim:] = q_pe
 
-    key_states = k_pe.new_empty(bsz, num_heads, q_len, q_head_dim)
+    key_states = k_pe.new_empty(
+        bsz, num_heads, q_len, q_head_dim
+    )  # [bsz, 128, q_len, 192] - [[change this]] new
     key_states[:, :, :, :qk_nope_head_dim] = k_nope
     key_states[:, :, :, qk_nope_head_dim:] = k_pe
 
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * softmax_scale
+    # Batched matmul: [bsz, num_heads, q_len, 192] @ [bsz, num_heads, 192, kv_seq_len].transpose(-1, -2)
+    attn_weights = (
+        torch.matmul(query_states, key_states.transpose(-1, -2)) * softmax_scale
+    )  # [bsz, num_heads, q_len, kv_seq_len] - [[change this]] new
 
     if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
         raise ValueError(
             f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
             f" {attn_weights.size()}"
         )
-    # assert attention_mask is not None
+    # Apply attention mask (which contains proper causal masking)
     if attention_mask is not None:
         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
             raise ValueError(
@@ -484,6 +497,7 @@ def torch_deepseek_prefill_no_absorb_attn(
         query_states.dtype
     )
 
+    # attn_output = torch.matmul(attn_weights, v_batched_t)
     attn_output = torch.matmul(attn_weights, value_states)
 
     if attn_output.size() != (bsz, num_heads, q_len, v_head_dim):
@@ -552,11 +566,12 @@ def flashinfer_deepseek_prefill_no_absorb_attn(
         kv_layout="NHD",
         use_cuda_graph=False,
     )
-    qo_indptr = torch.arange(0, bsz * q_len + 1, q_len).int()
-    kv_indptr = torch.arange(0, bsz * q_len + 1, q_len).int()
+    qo_indptr = torch.arange(0, bsz * q_len + 1, q_len).int().to(query_states.device)
+    kv_indptr = torch.arange(0, bsz * q_len + 1, q_len).int().to(query_states.device)
     head_dim_qk = 192
     head_dim_vo = 128
     causal = True
+
     wrapper.plan(
         qo_indptr,
         kv_indptr,
@@ -568,12 +583,14 @@ def flashinfer_deepseek_prefill_no_absorb_attn(
         q_data_type=query_states.dtype,
         kv_data_type=value_states.dtype,
         sm_scale=softmax_scale,
-        # custom_mask=attention_mask,
     )
-
+    query_states = query_states.transpose(1, 2).contiguous()
+    key_states = key_states.transpose(1, 2).contiguous()
+    value_states = value_states.transpose(1, 2).contiguous()
     query_states = query_states.reshape(-1, num_heads, head_dim_qk)
     key_states = key_states.reshape(-1, num_heads, head_dim_qk)
     value_states = value_states.reshape(-1, num_heads, head_dim_vo)
+
     attn_output = wrapper.run(query_states, key_states, value_states, return_lse=False)
     assert not torch.isnan(attn_output).any()
 
@@ -582,8 +599,7 @@ def flashinfer_deepseek_prefill_no_absorb_attn(
             f"`attn_output` should be of size {(bsz * q_len, num_heads, v_head_dim)}, but is"
             f" {attn_output.size()}"
         )
-    #
-    # attn_output = attn_output.transpose(1, 2).contiguous()
+
     attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
     return attn_output
 
@@ -763,6 +779,14 @@ def torch_deepseek_decode_only_absorb_attn(
         + torch.einsum("bshr,btr->bsht", q_pe, k_pe)  # [bsz, q_len, 128, kv_seq_len]
     ) * softmax_scale  # [bsz, q_len, 128, kv_seq_len]
 
+    attn_weights = attn_weights.transpose(1, 2).contiguous()  # [bsz, 128, q_len, kv_seq_len]
+
+    if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+
     assert attention_mask is not None
     if attention_mask is not None:
         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -774,48 +798,105 @@ def torch_deepseek_decode_only_absorb_attn(
     # upcast attention to fp32
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         q_pe.dtype
-    )  # [bsz, q_len, 128, kv_seq_len]
+    )  # [bsz, 128, q_len, kv_seq_len]
 
-    x = torch.einsum("bsht,btc->bshc", attn_weights, compressed_kv)  # [bsz, q_len, 128, 512]
+    x = torch.einsum("bhst,btc->bshc", attn_weights, compressed_kv)  # [bsz, q_len, 128, 512]
     attn_output = torch.einsum(
         "bshc,hdc->bshd", x, wkv_b[:, -v_head_dim:]
     )  # [bsz, q_len, 128, 128]
     return attn_output
 
 
-@pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("seqlen_q", [1])
-@pytest.mark.parametrize("batch_size", [4])
-@pytest.mark.parametrize("device", [torch.device("cuda:0")])
-@torch.inference_mode()
-def _test_debug_kernel(causal, dtype, seqlen_q, batch_size, device):
+def test_debug_flashinfer_prefill_kernel():
     torch.manual_seed(42)
-    config = DeepseekV3Config()
-    hf_deepseek_attn = DeepseekV3Attention(config).to(device).to(dtype)
 
-    # (batch_size, seq_len, dim)
-    hidden_states = torch.randn(batch_size, seqlen_q, config.hidden_size, dtype=dtype).to(device)
-    attention_mask = torch.ones(batch_size, 1, seqlen_q, seqlen_q, dtype=dtype).to(device)
-    # position_ids = torch.arange(seqlen_q, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-    # hf_deepseek_output, _, _ = hf_deepseek_attn(hidden_states, attention_mask, position_ids)
+    # Test configuration
+    num_qo_heads = 64
+    num_kv_heads = 16
+    head_dim = 128
+    softmax_scale = 1.0 / ((128 + 64) ** 0.5)
 
-    ad_deepseek_output_absorb, _, _ = hf_deepseek_attn.ad_forward(
-        hidden_states, attention_mask, attn_impl="absorb"
+    bsz = 7
+    q_len = 10
+    cnt_qo = bsz * q_len  # Total tokens across all batches
+    cnt_kv = cnt_qo
+
+    # We're not really testing a ragged input here, so the indptr jumps by q_len for all batches.
+    kv_indptr = torch.arange(0, bsz * q_len + 1, q_len).int()
+    qo_indptr = torch.arange(0, bsz * q_len + 1, q_len).int()
+
+    # Test inputs
+    q = torch.randn(cnt_qo, num_qo_heads, head_dim).to(torch.bfloat16).to("cuda:0")
+    k = torch.randn(cnt_kv, num_kv_heads, head_dim).to(torch.bfloat16).to("cuda:0")
+    v = torch.randn(cnt_kv, num_kv_heads, head_dim).to(torch.bfloat16).to("cuda:0")
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
+
+    prefill_wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+        sm_scale=softmax_scale,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
     )
-    assert ad_deepseek_output_absorb.shape == (batch_size, seqlen_q, config.hidden_size)
 
-    ad_deepseek_output_absorb_kernel, _, _ = hf_deepseek_attn.ad_forward(
-        hidden_states, attention_mask, attn_impl="absorb", use_kernel=True
-    )
-    assert ad_deepseek_output_absorb.shape == (batch_size, seqlen_q, config.hidden_size)
+    # FlashInfer output
+    o = prefill_wrapper.run(q, k, v)
 
-    diff = (ad_deepseek_output_absorb - ad_deepseek_output_absorb_kernel).abs().flatten()
-    print(diff)
-    print(f"max(diff)={max(diff)}")
-    assert torch.allclose(
-        ad_deepseek_output_absorb, ad_deepseek_output_absorb_kernel, atol=1e-2, rtol=1e-3
-    )
+    # Pytorch reference implementation for ragged GQA
+    # The key insight: we have 7 separate sequences of length 10, not one sequence of length 70
+    # Each sequence should be processed independently with its own causal mask
+
+    # Expand k and v to match the number of query heads
+    num_groups = num_qo_heads // num_kv_heads  # 64 // 16 = 4
+    k_expanded = k.repeat_interleave(num_groups, dim=1)  # [70, 16, 128] -> [70, 64, 128]
+    v_expanded = v.repeat_interleave(num_groups, dim=1)  # [70, 16, 128] -> [70, 64, 128]
+
+    # Reshape to separate batches: [70, 64, 128] -> [7, 10, 64, 128]
+    q_batched = q.view(bsz, q_len, num_qo_heads, head_dim)  # [7, 10, 64, 128]
+    k_batched = k_expanded.view(bsz, q_len, num_qo_heads, head_dim)  # [7, 10, 64, 128]
+    v_batched = v_expanded.view(bsz, q_len, num_qo_heads, head_dim)  # [7, 10, 64, 128]
+
+    # Process all batches simultaneously using batched operations
+    # Transpose all batches at once: [7, 10, 64, 128] -> [7, 64, 10, 128]
+    q_batched_t = q_batched.transpose(1, 2)  # [7, 64, 10, 128]
+    k_batched_t = k_batched.transpose(1, 2)  # [7, 64, 10, 128]
+    v_batched_t = v_batched.transpose(1, 2)  # [7, 64, 10, 128]
+
+    # Batched matmul: [7, 64, 10, 128] @ [7, 64, 128, 10] = [7, 64, 10, 10]
+    attn_weights = torch.matmul(q_batched_t, k_batched_t.transpose(-1, -2)) * softmax_scale
+
+    # Create causal mask once and broadcast: [10, 10] -> [1, 1, 10, 10]
+    causal_mask = torch.triu(torch.ones(q_len, q_len, device=q.device), diagonal=1).bool()
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 10, 10]
+
+    # Apply mask to all batches and heads at once
+    attn_weights.masked_fill_(causal_mask, float("-inf"))
+
+    # Batched softmax
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+
+    # Batched attention: [7, 64, 10, 10] @ [7, 64, 10, 128] = [7, 64, 10, 128]
+    attn_output_batched = torch.matmul(attn_weights, v_batched_t)
+
+    # Transpose back: [7, 64, 10, 128] -> [7, 10, 64, 128]
+    attn_output_batched = attn_output_batched.transpose(1, 2)
+
+    # Reshape back to original format: [7, 10, 64, 128] -> [70, 64, 128]
+    attn_output = attn_output_batched.reshape(-1, num_qo_heads, head_dim)
+
+    print(f"attn_output.shape: {attn_output.shape}")
+    print(f"o.shape: {o.shape}")
+
+    diff = (o - attn_output).abs()
+    print(f"max difference: {diff.max()}")
+
+    assert torch.allclose(o, attn_output, atol=2e-2, rtol=1e-3)
 
 
 @pytest.mark.parametrize("causal", [True])
@@ -831,7 +912,7 @@ def test_deepseek_mla_decode_no_cache(causal, dtype, seqlen_q, batch_size, devic
 
     # (batch_size, seq_len, dim)
     hidden_states = torch.randn(batch_size, seqlen_q, config.hidden_size, dtype=dtype).to(device)
-    attention_mask = torch.ones(batch_size, 1, seqlen_q, seqlen_q, dtype=dtype).to(device)
+    attention_mask = torch.zeros(batch_size, 1, seqlen_q, seqlen_q, dtype=dtype).to(device)
     # position_ids = torch.arange(seqlen_q, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
     # hf_deepseek_output, _, _ = hf_deepseek_attn(hidden_states, attention_mask, position_ids)
 
@@ -873,24 +954,11 @@ def test_deepseek_mla_decode_no_cache(causal, dtype, seqlen_q, batch_size, devic
     )
 
 
-# def causal_attention_mask(batch_size, q_seq, kv_seq, device=None):
-#     # Create a matrix with 0s on and below the diagonal (allowed), 1s above (future, masked)
-#     mask = torch.triu(torch.ones(batch_size, 1, q_seq, kv_seq, device=device), diagonal=1)
-#     # Convert to boolean for masking
-#     mask = mask.bool()
-#     # Fill masked positions with -inf, others with 0
-#     mask = torch.where(mask, float('-inf'), 0.0)
-#     return mask  # shape: (q_seq, kv_seq)
-
-
-# def causal_attention_mask(batch_size, q_seq, kv_seq, device=None):
-#     # Create a matrix with 0s on and below the diagonal (allowed), 1s above (future, masked)
-#     mask = torch.zeros(batch_size, 1, q_seq, kv_seq, device=device)
-#     # Convert to boolean for masking
-#     mask = mask.bool()
-#     # Fill masked positions with -inf, others with 0
-#     mask = torch.where(mask, float("-inf"), 0.0)
-#     return mask  # shape: (q_seq, kv_seq)
+def causal_attention_mask(batch_size, seqlen_q, seqlen_k, device, dtype=torch.bfloat16):
+    causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_k, device=device), diagonal=1).bool()
+    attention_mask = torch.zeros(batch_size, 1, seqlen_q, seqlen_k, dtype=dtype, device=device)
+    attention_mask.masked_fill_(causal_mask, float("-inf"))
+    return attention_mask
 
 
 @pytest.mark.parametrize("causal", [True])
@@ -905,12 +973,11 @@ def test_deepseek_mla_prefill(causal, dtype, seqlen_q, batch_size, device):
     hf_deepseek_attn = DeepseekV3Attention(config).to(device).to(dtype)
 
     hidden_states = torch.randn(batch_size, seqlen_q, config.hidden_size, dtype=dtype).to(device)
-    attention_mask = torch.ones(batch_size, 1, seqlen_q, seqlen_q, dtype=dtype).to(device)
-    # attention_mask = torch.tril(torch.ones(batch_size, 1, seqlen_q, seqlen_q)).to(device)
-    # attention_mask = causal_attention_mask(batch_size, seqlen_q, seqlen_q, device)
-    print(attention_mask)
 
-    # attention_mask = None #!!!!
+    # Create proper causal mask: 0 for past/current positions, -inf for future positions
+    causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_q, device=device), diagonal=1).bool()
+    attention_mask = torch.zeros(batch_size, 1, seqlen_q, seqlen_q, dtype=dtype, device=device)
+    attention_mask.masked_fill_(causal_mask, float("-inf"))
 
     hf_deepseek_ref_output, _, _ = hf_deepseek_attn.forward(hidden_states, attention_mask)
     assert hf_deepseek_ref_output.shape == (batch_size, seqlen_q, config.hidden_size)
@@ -932,9 +999,9 @@ def test_deepseek_mla_prefill(causal, dtype, seqlen_q, batch_size, device):
     )
     assert ad_deepseek_output_no_absorb_kernel.shape == (batch_size, seqlen_q, config.hidden_size)
 
-    diff = (hf_deepseek_ref_output - ad_deepseek_output_no_absorb_kernel).abs().flatten()
+    diff = (hf_deepseek_ref_output - ad_deepseek_output_no_absorb_kernel).abs()
     print(diff)
-    print(f"prefill (no-absorb) ref vs flashinfer max(diff)={max(diff)}")
+    print(f"prefill (no-absorb) ref vs flashinfer max(diff)={diff.max()}")
     assert torch.allclose(
         hf_deepseek_ref_output, ad_deepseek_output_no_absorb_kernel, atol=1e-2, rtol=1e-3
     )
@@ -1014,9 +1081,13 @@ def test_deepseek_mla_decode_cache(
 
     # (batch_size, seq_len, dim)
     hidden_states = torch.randn(batch_size, seqlen_q, config.hidden_size, dtype=dtype).to(device)
-    attention_mask = torch.ones(batch_size, 1, seqlen_q, seqlen_q + seqlen_kv, dtype=dtype).to(
+    # the model is decoding the next token (L+1), the attention mask has shape [1, L+1].
+    # The mask will allow the new token to attend to all past tokens—including itself
+    attention_mask = torch.zeros(batch_size, 1, seqlen_q, seqlen_q + seqlen_kv, dtype=dtype).to(
         device
     )
+    # attention_mask = causal_attention_mask(batch_size, seqlen_q, seqlen_q + seqlen_kv, device, dtype)
+
     # attention_mask = torch.tril(torch.ones(seqlen_q, seqlen_kv+seqlen_q)).bool()
     compressed_kv_normed_cache, k_pe_cache = create_linear_caches(
         max_batch_size, max_seq_len, device, dtype, init_randn=True
@@ -1047,9 +1118,9 @@ def test_deepseek_mla_decode_cache(
     )
     assert ad_deepseek_output_absorb_kernel.shape == (batch_size, seqlen_q, config.hidden_size)
 
-    diff = (ad_deepseek_output_absorb - ad_deepseek_output_absorb_kernel).abs().flatten()
+    diff = (ad_deepseek_output_absorb - ad_deepseek_output_absorb_kernel).abs()
     print(diff)
-    print(f"decode torch vs flashinfermax(diff)={max(diff)}")
+    print(f"decode torch vs flashinfermax(diff)={diff.max()}")
     assert torch.allclose(
         ad_deepseek_output_absorb, ad_deepseek_output_absorb_kernel, atol=1e-2, rtol=1e-3
     )
