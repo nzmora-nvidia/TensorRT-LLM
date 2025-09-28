@@ -614,12 +614,12 @@ def flashinfer_deepseek_decode_only_absorb_attn(
     attention_mask: torch.Tensor,
     start_pos: int,
     # CACHES
-    ckv_cache: torch.Tensor,
-    k_pe_cache: torch.Tensor,
+    ckv_cache: torch.Tensor,  # [page_num, page_size, ckv_dim]
+    k_pe_cache: torch.Tensor,  # [page_num, page_size, k_pe_dim]
     # CONSTANTS
     softmax_scale: float,
-    sin: torch.Tensor,
-    cos: torch.Tensor,
+    sin_cache: torch.Tensor,
+    cos_cache: torch.Tensor,
     wkv_b: torch.Tensor,  # [128 * 256, 512]
 ):
     """
@@ -636,8 +636,8 @@ def flashinfer_deepseek_decode_only_absorb_attn(
     assert kv_seq_len == kpe_len == q_len
     assert num_heads == 128
     assert qk_nope_head_dim == 128
-    assert sin is not None
-    assert cos is not None
+    assert sin_cache is not None
+    assert cos_cache is not None
     head_dim_ckv = kv_lora_rank
     assert q_len == 1, "q_len must be 1 for matrix absorption with flashinfer"
 
@@ -649,7 +649,9 @@ def flashinfer_deepseek_decode_only_absorb_attn(
     q_nope = q_nope.transpose(1, 2).contiguous()  # [bsz, q_len, 128, 128]
     q_nope = torch.einsum("bshd,hdc->bshc", q_nope, w_ukv)  # [bsz, q_len, 128, 512]
 
-    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos[:kv_seq_len], sin[:kv_seq_len], position_ids)
+    q_pe, k_pe = apply_rotary_pos_emb(
+        q_pe, k_pe, cos_cache[:kv_seq_len], sin_cache[:kv_seq_len], position_ids
+    )
     q_pe = q_pe.transpose(1, 2).contiguous()
     k_pe = k_pe.squeeze(2)  # [bsz, kv_seq_len, 64]
 
