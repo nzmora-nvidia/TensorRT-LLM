@@ -551,3 +551,172 @@ def mla(
 ) -> torch.Tensor:
     """MLA style attention that handles compressed kv."""
     return torch.empty_like(q_nope)
+
+
+@torch.library.custom_op("auto_deploy::torch_deepseek_prefill_no_absorb_attn", mutates_args=())
+def torch_deepseek_prefill_no_absorb_attn(
+    # q_nope: torch.Tensor,  # [bsz, 128, q_len, 128]
+    # q_pe: torch.Tensor,  # [bsz, 128, q_len, 64]
+    q_normed_dn: torch.Tensor,  # [bsz, q_len, self.q_lora_rank=1536]
+    compressed_kv: torch.Tensor,  # [bsz, q_len, 512]
+    k_pe: torch.Tensor,  # [bsz, 1, q_len, 64]
+    # METADATA
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    # CONSTANTS
+    softmax_scale: float,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    wkv_b: torch.Tensor,  # [128 * 256, 512]
+    wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+) -> torch.Tensor:
+    # This is the original unmodified code from Hugging Face
+    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+        """Applies Rotary Position Embedding to the query and key tensors.
+
+        Returns:
+            `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+        """
+
+        def rotate_half(x):
+            """Rotates half the hidden dims of the input."""
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+
+        b, h, s, d = q.shape
+        q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+        b, h, s, d = k.shape
+        k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    # return torch.empty(bsz, q_len, num_heads * v_head_dim).to(device=q_normed_dn.device, dtype=q_normed_dn.dtype)
+
+    v_head_dim = 128
+    num_heads = 128
+    qk_nope_head_dim = 128
+    bsz, q_len, q_lora_rank = q_normed_dn.shape
+    ckv_bsz, kv_seq_len, head_dim_ckv = compressed_kv.shape
+    assert ckv_bsz == bsz
+    assert kv_seq_len == q_len
+    assert sin is not None
+    assert cos is not None
+
+    # q_normed_dn * (W^UQ and W^QR) (i.e. q up projection)
+    wq_b = wq_b.reshape(num_heads, -1, q_lora_rank)
+    q = torch.einsum("bsl,hdl->bhsd", q_normed_dn, wq_b)  # [bsz, 128, q_len, 192]
+    q_head_dim = q.shape[-1]  # 192
+    qk_rope_head_dim = q_head_dim - qk_nope_head_dim
+    assert qk_rope_head_dim == 64
+
+    # Separate q into the no-positional encoding part (q_nope) and the positional encoding part (q_pe)
+    q_nope, q_pe = torch.split(
+        q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1
+    )  # q_nope ~ [bsz, 128, q_len, 128], q_pe ~ [bsz, 128, q_len, 64]
+
+    # Ensure contiguous memory layout for CUDA operations
+    q_nope = q_nope.contiguous()
+    q_pe = q_pe.contiguous()
+
+    # kv = c_K * W^UK (i.e. upward projection)
+    kv = (
+        torch.einsum(
+            "bsc,xc->bsx", compressed_kv, wkv_b
+        )  # [bsz, q_len, 128*512] - [[change this]] new
+        .view(
+            bsz, q_len, num_heads, qk_nope_head_dim + v_head_dim
+        )  # [bsz, q_len, 128, 256] - [[change this]] new
+        .transpose(1, 2)  # [bsz, 128, q_len, 256] - [[change this]] new
+    )
+
+    k_nope, value_states = torch.split(
+        kv, [qk_nope_head_dim, v_head_dim], dim=-1
+    )  # k_nope ~ [bsz, 128, q_len, 128], value_states ~ [bsz, 128, q_len, 128] - [[change this]] new
+
+    # Ensure contiguous memory layout for CUDA operations
+    k_nope = k_nope.contiguous()
+    value_states = value_states.contiguous()
+
+    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+    query_states = k_pe.new_empty(
+        bsz, num_heads, q_len, q_head_dim
+    )  # [bsz, 128, q_len, 192] - [[change this]] new
+    query_states[:, :, :, :qk_nope_head_dim] = q_nope
+    query_states[:, :, :, qk_nope_head_dim:] = q_pe
+
+    key_states = k_pe.new_empty(
+        bsz, num_heads, q_len, q_head_dim
+    )  # [bsz, 128, q_len, 192] - [[change this]] new
+    key_states[:, :, :, :qk_nope_head_dim] = k_nope
+    key_states[:, :, :, qk_nope_head_dim:] = k_pe
+
+    # Batched matmul: [bsz, num_heads, q_len, 192] @ [bsz, num_heads, 192, kv_seq_len].transpose(-1, -2)
+    attn_weights = (
+        torch.matmul(query_states, key_states.transpose(-1, -2)) * softmax_scale
+    )  # [bsz, num_heads, q_len, kv_seq_len] - [[change this]] new
+
+    if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
+        raise ValueError(
+            f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
+            f" {attn_weights.size()}"
+        )
+    # Apply attention mask (which contains proper causal masking)
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        attn_weights = attn_weights + attention_mask
+
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query_states.dtype
+    )
+
+    # attn_output = torch.matmul(attn_weights, v_batched_t)
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    if attn_output.size() != (bsz, num_heads, q_len, v_head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, num_heads, q_len, v_head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
+    return attn_output
+
+
+@torch_deepseek_prefill_no_absorb_attn.register_fake
+def torch_deepseek_prefill_no_absorb_attn(
+    # q_nope: torch.Tensor,  # [bsz, 128, q_len, 128]
+    # q_pe: torch.Tensor,  # [bsz, 128, q_len, 64]
+    q_normed_dn: torch.Tensor,  # [bsz, q_len, self.q_lora_rank=1536]
+    compressed_kv: torch.Tensor,  # [bsz, q_len, 512]
+    k_pe: torch.Tensor,  # [bsz, 1, q_len, 64]
+    # METADATA
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    # CONSTANTS
+    softmax_scale: float,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    wkv_b: torch.Tensor,  # [128 * 256, 512]
+    wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+) -> torch.Tensor:
+    v_head_dim = 128
+    num_heads = 128
+    bsz, q_len, q_lora_rank = q_normed_dn.shape
+
+    attn_output = torch.empty(bsz, q_len, num_heads * v_head_dim).to(
+        device=q_normed_dn.device, dtype=q_normed_dn.dtype
+    )
+    return attn_output
