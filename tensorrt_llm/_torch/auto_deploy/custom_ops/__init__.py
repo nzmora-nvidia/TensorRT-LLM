@@ -5,11 +5,12 @@ from .dist import *
 from .flashinfer_attention import *
 from .flashinfer_rope import *
 from .linear import *
-from .mla import *
 from .quant import *
 from .rms_norm import *
 from .torch_attention import *
 from .torch_backend_attention import *
+from .torch_mla import *
+from .torch_mla_backend import *
 from .torch_moe import *
 from .torch_quant import *
 from .torch_rope import *

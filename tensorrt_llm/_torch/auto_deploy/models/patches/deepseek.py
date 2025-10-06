@@ -19,7 +19,6 @@ def deepseek_v3_attention(
     use_cache: bool = False,
     **kwargs,
 ):
-
     """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
     if "padding_mask" in kwargs:
         warnings.warn(
@@ -29,12 +28,12 @@ def deepseek_v3_attention(
     bsz, q_len, _ = hidden_states.size()
 
     assert self.q_lora_rank is not None, "q_lora_rank must be set"
-    
+
     # x * W^DQ (i.e. q down projection)
-    q_normed_dn = self.q_a_layernorm(self.q_a_proj(hidden_states)) # (bsz, q_len, self.q_lora_rank)
+    q_normed_dn = self.q_a_layernorm(self.q_a_proj(hidden_states))  # (bsz, q_len, self.q_lora_rank)
 
     # (x * W^DQ) * (W^UQ and W^QR) (i.e. q up projection)
-    #q = self.q_b_proj(q_normed_dn)
+    # q = self.q_b_proj(q_normed_dn)
 
     # q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(
     #     1, 2
@@ -45,16 +44,15 @@ def deepseek_v3_attention(
     #     q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
     # )  # q_nope ~ [bsz, 128, q_len, 128], q_pe ~ [bsz, 128, q_len, 64]
 
-
-    # NEW - absrobed q_pe prep
-    wq_b = self.q_b_proj.weight # (self.num_heads * self.q_head_dim, self.q_lora_rank)
-    #wq_b_t = wq_b.transpose(0, 1).reshape(self.q_lora_rank, self.num_heads, self.q_head_dim)
-    #q_b_proj_q_nope = wq_b_t[:, :, :self.qk_nope_head_dim]
-    #q_b_proj_q_pe = wq_b_t[:, :, self.qk_nope_head_dim:]
+    # NEW - absorbed q_pe prep
+    wq_b = self.q_b_proj.weight  # (self.num_heads * self.q_head_dim, self.q_lora_rank)
+    # wq_b_t = wq_b.transpose(0, 1).reshape(self.q_lora_rank, self.num_heads, self.q_head_dim)
+    # q_b_proj_q_nope = wq_b_t[:, :, :self.qk_nope_head_dim]
+    # q_b_proj_q_pe = wq_b_t[:, :, self.qk_nope_head_dim:]
     # (x * W^DQ) * W^UQ (i.e. q_nope up projection)
-    #q_nope = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_nope)
+    # q_nope = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_nope)
     # (x * W^DQ) * W^QR (i.e. q_pe up projection)
-    #q_pe = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_pe)
+    # q_pe = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_pe)
 
     # c_KV = x * W^DKV (i.e. kv down projection)
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)  # [bsz, q_len, 512 + 64]
@@ -78,32 +76,26 @@ def deepseek_v3_attention(
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
     # Is not an issue, because we intend to replace mla op with our implementation further along the pipeline
-    # attn_output = torch.ops.auto_deploy.torch_attention_deepseek_fused_mla(
-    #     q_nope,
-    #     q_pe,
-    #     kv,
-    #     k_pe,
-    #     cos,
-    #     sin,
-    #     position_ids,
-    #     attention_mask,
-    #     self.softmax_scale,
-    # )
     args = (
-                #q_nope,
-                #q_pe,
-                q_normed_dn,
-                compressed_kv,
-                k_pe,
-                position_ids,
-                attention_mask,  # METADATA
-                self.softmax_scale,
-                sin,
-                cos,
-                wkv_b,  # CONSTANTS
-                wq_b,
-            )
-    attn_output = torch.ops.auto_deploy.torch_deepseek_prefill_no_absorb_attn(*args)
+        # q_nope,
+        # q_pe,
+        q_normed_dn,
+        compressed_kv,
+        k_pe,
+        sin,
+        cos,
+        wkv_b,  # CONSTANTS
+        wq_b,
+        position_ids,  # METADATA
+        # attention_mask,  # METADATA
+        self.softmax_scale,  # CONSTANTS
+        # sin,
+        # cos,
+        # wkv_b,  # CONSTANTS
+        # wq_b,
+    )
+    # attn_output = torch.ops.auto_deploy.torch_deepseek_prefill_no_absorb_attn(*args)
+    attn_output = torch.ops.auto_deploy.torch_deepseek_mla_no_cache(*args)
     attn_output = self.o_proj(attn_output)
     if not output_attentions:
         attn_weights = None
@@ -127,17 +119,19 @@ def deepseek_v3_attention(
         print(f"Debug: In apply_rotary_pos_emb - cos.shape={cos.shape}, sin.shape={sin.shape}")
         print(f"Debug: position_ids.shape={position_ids.shape}, position_ids={position_ids}")
         print(f"Debug: unsqueeze_dim={unsqueeze_dim}")
-        
+
         # Add bounds checking for the indexing operation that could be causing the device assertion
         # if position_ids.max() >= cos.shape[0]:
         #     raise RuntimeError(f"In apply_rotary_pos_emb: position_ids.max() ({position_ids.max()}) >= cos.shape[0] ({cos.shape[0]})")
         # if position_ids.min() < 0:
         #     raise RuntimeError(f"In apply_rotary_pos_emb: position_ids.min() ({position_ids.min()}) < 0")
-            
+
         try:
             _cos = cos[position_ids].unsqueeze(unsqueeze_dim)
             _sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-            print(f"Debug: Successfully indexed cos and sin, new shapes: cos={cos.shape}, sin={sin.shape}")
+            print(
+                f"Debug: Successfully indexed cos and sin, new shapes: cos={cos.shape}, sin={sin.shape}"
+            )
         except Exception as e:
             print(f"Debug: Error indexing cos/sin: {e}")
             raise
@@ -161,22 +155,27 @@ def deepseek_v3_attention(
     assert kv_seq_len == q_len
     assert sin is not None
     assert cos is not None
-    
+
     # Validate dimensions match expectations before reshape
-    expected_wq_b_shape = (num_heads * (qk_nope_head_dim + 64), q_lora_rank)  # 64 = qk_rope_head_dim
+    expected_wq_b_shape = (
+        num_heads * (qk_nope_head_dim + 64),
+        q_lora_rank,
+    )  # 64 = qk_rope_head_dim
     if wq_b.shape != expected_wq_b_shape:
         raise RuntimeError(f"wq_b shape mismatch: got {wq_b.shape}, expected {expected_wq_b_shape}")
-    
+
     wq_b = wq_b.reshape(num_heads, -1, q_lora_rank)
-    print(f"Debug: About to perform einsum with q_normed_dn.shape={q_normed_dn.shape}, wq_b.shape={wq_b.shape}")
-    
+    print(
+        f"Debug: About to perform einsum with q_normed_dn.shape={q_normed_dn.shape}, wq_b.shape={wq_b.shape}"
+    )
+
     try:
-        q = torch.einsum("bsl,hdl->bhsd", q_normed_dn, wq_b) # [bsz, 128, q_len, 192]
+        q = torch.einsum("bsl,hdl->bhsd", q_normed_dn, wq_b)  # [bsz, 128, q_len, 192]
         print(f"Debug: einsum successful, q.shape={q.shape}")
     except Exception as e:
         print(f"Debug: Error in einsum: {e}")
         raise
-    q_head_dim = q.shape[-1] # 192
+    q_head_dim = q.shape[-1]  # 192
     qk_rope_head_dim = q_head_dim - qk_nope_head_dim
     assert qk_rope_head_dim == 64
 
@@ -186,26 +185,28 @@ def deepseek_v3_attention(
     q_nope, q_pe = torch.split(
         q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1
     )  # q_nope ~ [bsz, 128, q_len, 128], q_pe ~ [bsz, 128, q_len, 64]
-    
+
     # Ensure contiguous memory layout for CUDA operations
     q_nope = q_nope.contiguous()
     q_pe = q_pe.contiguous()
 
     # kv = c_K * W^UK (i.e. upward projection)
-    print(f"Debug: About to perform kv einsum with compressed_kv.shape={compressed_kv.shape}, wkv_b.shape={wkv_b.shape}")
-    
+    print(
+        f"Debug: About to perform kv einsum with compressed_kv.shape={compressed_kv.shape}, wkv_b.shape={wkv_b.shape}"
+    )
+
     try:
         kv_result = torch.einsum(
             "bsc,xc->bsx", compressed_kv, wkv_b
         )  # [bsz, q_len, 128*512] - [[change this]] new
         print(f"Debug: kv einsum successful, result.shape={kv_result.shape}")
-        
+
         kv = (
-            kv_result
-            .view(
+            kv_result.view(
                 bsz, q_len, num_heads, qk_nope_head_dim + v_head_dim
-            )  # [bsz, q_len, 128, 256] - [[change this]] new
-            .transpose(1, 2)  # [bsz, 128, q_len, 256] - [[change this]] new
+            ).transpose(  # [bsz, q_len, 128, 256] - [[change this]] new
+                1, 2
+            )  # [bsz, 128, q_len, 256] - [[change this]] new
         )
         print(f"Debug: kv reshape and transpose successful, kv.shape={kv.shape}")
     except Exception as e:
@@ -215,7 +216,7 @@ def deepseek_v3_attention(
     k_nope, value_states = torch.split(
         kv, [qk_nope_head_dim, v_head_dim], dim=-1
     )  # k_nope ~ [bsz, 128, q_len, 128], value_states ~ [bsz, 128, q_len, 128] - [[change this]] new
-    
+
     # Ensure contiguous memory layout for CUDA operations
     k_nope = k_nope.contiguous()
     value_states = value_states.contiguous()
@@ -224,50 +225,54 @@ def deepseek_v3_attention(
     print(f"Debug: Before rotary_pos_emb - cos.shape={cos.shape}, sin.shape={sin.shape}")
     print(f"Debug: kv_seq_len={kv_seq_len}, position_ids.shape={position_ids.shape}")
     print(f"Debug: position_ids min={position_ids.min()}, max={position_ids.max()}")
-    
+
     # Check bounds before slicing cos/sin
     if kv_seq_len > cos.shape[0]:
         raise RuntimeError(f"kv_seq_len ({kv_seq_len}) > cos.shape[0] ({cos.shape[0]})")
-    if kv_seq_len > sin.shape[0]:  
+    if kv_seq_len > sin.shape[0]:
         raise RuntimeError(f"kv_seq_len ({kv_seq_len}) > sin.shape[0] ({sin.shape[0]})")
-    
+
     # Check position_ids bounds
     # if position_ids.max() >= cos.shape[0]:
     #     raise RuntimeError(f"position_ids.max() ({position_ids.max()}) >= cos.shape[0] ({cos.shape[0]})")
     # if position_ids.min() < 0:
     #     raise RuntimeError(f"position_ids.min() ({position_ids.min()}) < 0")
-    
+
     q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
     print(f"Debug: After rotary_pos_emb - q_pe.shape={q_pe.shape}, k_pe.shape={k_pe.shape}")
     # return torch.randn_like(hidden_states), None, None
     query_states = k_pe.new_empty(
         bsz, num_heads, q_len, q_head_dim
     )  # [bsz, 128, q_len, 192] - [[change this]] new
-    
+
     # Validate tensor dimensions before indexing to prevent device-side assertions
     if q_nope.shape != (bsz, num_heads, q_len, qk_nope_head_dim):
-        raise RuntimeError(f"q_nope shape mismatch: got {q_nope.shape}, expected {(bsz, num_heads, q_len, qk_nope_head_dim)}")
+        raise RuntimeError(
+            f"q_nope shape mismatch: got {q_nope.shape}, expected {(bsz, num_heads, q_len, qk_nope_head_dim)}"
+        )
     if q_pe.shape[-1] != q_head_dim - qk_nope_head_dim:
-        raise RuntimeError(f"q_pe last dimension mismatch: got {q_pe.shape[-1]}, expected {q_head_dim - qk_nope_head_dim}")
+        raise RuntimeError(
+            f"q_pe last dimension mismatch: got {q_pe.shape[-1]}, expected {q_head_dim - qk_nope_head_dim}"
+        )
     if qk_nope_head_dim > q_head_dim:
         raise RuntimeError(f"qk_nope_head_dim ({qk_nope_head_dim}) > q_head_dim ({q_head_dim})")
-        
+
     # Add step-by-step debugging for tensor assignments
     print(f"Debug: About to assign q_nope to query_states[:, :, :, :{qk_nope_head_dim}]")
     print(f"Debug: query_states slice shape: {query_states[:, :, :, :qk_nope_head_dim].shape}")
     print(f"Debug: q_nope shape: {q_nope.shape}")
-    
+
     try:
         query_states[:, :, :, :qk_nope_head_dim] = q_nope
         print("Debug: Successfully assigned q_nope")
     except Exception as e:
         print(f"Debug: Error assigning q_nope: {e}")
         raise
-    
+
     print(f"Debug: About to assign q_pe to query_states[:, :, :, {qk_nope_head_dim}:]")
     print(f"Debug: query_states slice shape: {query_states[:, :, :, qk_nope_head_dim:].shape}")
     print(f"Debug: q_pe shape: {q_pe.shape}")
-    
+
     try:
         query_states[:, :, :, qk_nope_head_dim:] = q_pe
         print("Debug: Successfully assigned q_pe")
@@ -318,7 +323,6 @@ def deepseek_v3_attention(
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
-
 
     ##################################################################
     attn_output = self.o_proj(attn_output)
