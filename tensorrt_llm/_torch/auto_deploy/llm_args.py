@@ -133,7 +133,7 @@ class AutoDeployConfig(DynamicYamlMixInForSettings, BaseSettings):
         default="flashinfer", description="Attention backend to use."
     )
 
-    mla_backend: Literal["TorchMLABackend"] = Field(
+    mla_backend: Literal["TorchMLABackend", "FlashinferMLABackend"] = Field(
         default="TorchMLABackend",
         description="The Multi-Head Latent Attention backend to use.",
     )
