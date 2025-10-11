@@ -8,6 +8,8 @@ from transformers import AutoModelForCausalLM
 from transformers.cache_utils import Cache
 
 
+# The model is in
+# /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/autodeploy_data/hf_home/modules/transformers_modules/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad/modeling_deepseek.py
 @torch.inference_mode()
 def deepseek_v3_attention(
     self,
@@ -19,7 +21,12 @@ def deepseek_v3_attention(
     use_cache: bool = False,
     **kwargs,
 ):
-    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op."""
+    """DeepSeekV3Attention forward function rewritten to wrap MultiheadLatentAttention as a custom op.
+
+    TODO: explain what I'm doing here
+
+
+    """
     if "padding_mask" in kwargs:
         warnings.warn(
             "Passing `padding_mask` is deprecated and will be removed in v4.37. "
@@ -69,263 +76,30 @@ def deepseek_v3_attention(
 
     # Patching begins here: delegate the rest to one of the AD operators
     # cos, sin = self.rotary_emb.get_cos_sin_cache()
-    cos, sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cached
+    cos_cache, sin_cache = self.rotary_emb.cos_cached, self.rotary_emb.sin_cached
 
     wkv_b = self.kv_b_proj.weight  # [128 * 256, 512]
+    wo_proj = self.o_proj.weight
 
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
     # Is not an issue, because we intend to replace mla op with our implementation further along the pipeline
     args = (
-        # q_nope,
-        # q_pe,
         q_normed_dn,
         compressed_kv,
         k_pe,
-        sin,
-        cos,
+        sin_cache,
+        cos_cache,
         wkv_b,  # CONSTANTS
         wq_b,
+        None,
+        wo_proj,
         position_ids,  # METADATA
-        # attention_mask,  # METADATA
         self.softmax_scale,  # CONSTANTS
-        # sin,
-        # cos,
-        # wkv_b,  # CONSTANTS
-        # wq_b,
     )
-    # attn_output = torch.ops.auto_deploy.torch_deepseek_prefill_no_absorb_attn(*args)
+
     attn_output = torch.ops.auto_deploy.torch_deepseek_mla_no_cache(*args)
-    attn_output = self.o_proj(attn_output)
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
-
-    ##################################################################
-    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-        """Applies Rotary Position Embedding to the query and key tensors.
-
-        Returns:
-            `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-        """
-
-        def rotate_half(x):
-            """Rotates half the hidden dims of the input."""
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        print(f"Debug: In apply_rotary_pos_emb - cos.shape={cos.shape}, sin.shape={sin.shape}")
-        print(f"Debug: position_ids.shape={position_ids.shape}, position_ids={position_ids}")
-        print(f"Debug: unsqueeze_dim={unsqueeze_dim}")
-
-        # Add bounds checking for the indexing operation that could be causing the device assertion
-        # if position_ids.max() >= cos.shape[0]:
-        #     raise RuntimeError(f"In apply_rotary_pos_emb: position_ids.max() ({position_ids.max()}) >= cos.shape[0] ({cos.shape[0]})")
-        # if position_ids.min() < 0:
-        #     raise RuntimeError(f"In apply_rotary_pos_emb: position_ids.min() ({position_ids.min()}) < 0")
-
-        try:
-            _cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-            _sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-            print(
-                f"Debug: Successfully indexed cos and sin, new shapes: cos={cos.shape}, sin={sin.shape}"
-            )
-        except Exception as e:
-            print(f"Debug: Error indexing cos/sin: {e}")
-            raise
-
-        b, h, s, d = q.shape
-        q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-        b, h, s, d = k.shape
-        k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-        q_embed = (q * _cos) + (rotate_half(q) * _sin)
-        k_embed = (k * _cos) + (rotate_half(k) * _sin)
-        return q_embed, k_embed
-
-    v_head_dim = 128
-    num_heads = 128
-    qk_nope_head_dim = 128
-    bsz, q_len, q_lora_rank = q_normed_dn.shape
-    ckv_bsz, kv_seq_len, head_dim_ckv = compressed_kv.shape
-    assert ckv_bsz == bsz
-    assert kv_seq_len == q_len
-    assert sin is not None
-    assert cos is not None
-
-    # Validate dimensions match expectations before reshape
-    expected_wq_b_shape = (
-        num_heads * (qk_nope_head_dim + 64),
-        q_lora_rank,
-    )  # 64 = qk_rope_head_dim
-    if wq_b.shape != expected_wq_b_shape:
-        raise RuntimeError(f"wq_b shape mismatch: got {wq_b.shape}, expected {expected_wq_b_shape}")
-
-    wq_b = wq_b.reshape(num_heads, -1, q_lora_rank)
-    print(
-        f"Debug: About to perform einsum with q_normed_dn.shape={q_normed_dn.shape}, wq_b.shape={wq_b.shape}"
-    )
-
-    try:
-        q = torch.einsum("bsl,hdl->bhsd", q_normed_dn, wq_b)  # [bsz, 128, q_len, 192]
-        print(f"Debug: einsum successful, q.shape={q.shape}")
-    except Exception as e:
-        print(f"Debug: Error in einsum: {e}")
-        raise
-    q_head_dim = q.shape[-1]  # 192
-    qk_rope_head_dim = q_head_dim - qk_nope_head_dim
-    assert qk_rope_head_dim == 64
-
-    # return torch.randn_like(hidden_states), None, None
-
-    # Separate q into the no-positional encoding part (q_nope) and the positional encoding part (q_pe)
-    q_nope, q_pe = torch.split(
-        q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1
-    )  # q_nope ~ [bsz, 128, q_len, 128], q_pe ~ [bsz, 128, q_len, 64]
-
-    # Ensure contiguous memory layout for CUDA operations
-    q_nope = q_nope.contiguous()
-    q_pe = q_pe.contiguous()
-
-    # kv = c_K * W^UK (i.e. upward projection)
-    print(
-        f"Debug: About to perform kv einsum with compressed_kv.shape={compressed_kv.shape}, wkv_b.shape={wkv_b.shape}"
-    )
-
-    try:
-        kv_result = torch.einsum(
-            "bsc,xc->bsx", compressed_kv, wkv_b
-        )  # [bsz, q_len, 128*512] - [[change this]] new
-        print(f"Debug: kv einsum successful, result.shape={kv_result.shape}")
-
-        kv = (
-            kv_result.view(
-                bsz, q_len, num_heads, qk_nope_head_dim + v_head_dim
-            ).transpose(  # [bsz, q_len, 128, 256] - [[change this]] new
-                1, 2
-            )  # [bsz, 128, q_len, 256] - [[change this]] new
-        )
-        print(f"Debug: kv reshape and transpose successful, kv.shape={kv.shape}")
-    except Exception as e:
-        print(f"Debug: Error in kv operations: {e}")
-        raise
-
-    k_nope, value_states = torch.split(
-        kv, [qk_nope_head_dim, v_head_dim], dim=-1
-    )  # k_nope ~ [bsz, 128, q_len, 128], value_states ~ [bsz, 128, q_len, 128] - [[change this]] new
-
-    # Ensure contiguous memory layout for CUDA operations
-    k_nope = k_nope.contiguous()
-    value_states = value_states.contiguous()
-
-    # Add debugging for rotary embedding inputs
-    print(f"Debug: Before rotary_pos_emb - cos.shape={cos.shape}, sin.shape={sin.shape}")
-    print(f"Debug: kv_seq_len={kv_seq_len}, position_ids.shape={position_ids.shape}")
-    print(f"Debug: position_ids min={position_ids.min()}, max={position_ids.max()}")
-
-    # Check bounds before slicing cos/sin
-    if kv_seq_len > cos.shape[0]:
-        raise RuntimeError(f"kv_seq_len ({kv_seq_len}) > cos.shape[0] ({cos.shape[0]})")
-    if kv_seq_len > sin.shape[0]:
-        raise RuntimeError(f"kv_seq_len ({kv_seq_len}) > sin.shape[0] ({sin.shape[0]})")
-
-    # Check position_ids bounds
-    # if position_ids.max() >= cos.shape[0]:
-    #     raise RuntimeError(f"position_ids.max() ({position_ids.max()}) >= cos.shape[0] ({cos.shape[0]})")
-    # if position_ids.min() < 0:
-    #     raise RuntimeError(f"position_ids.min() ({position_ids.min()}) < 0")
-
-    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
-    print(f"Debug: After rotary_pos_emb - q_pe.shape={q_pe.shape}, k_pe.shape={k_pe.shape}")
-    # return torch.randn_like(hidden_states), None, None
-    query_states = k_pe.new_empty(
-        bsz, num_heads, q_len, q_head_dim
-    )  # [bsz, 128, q_len, 192] - [[change this]] new
-
-    # Validate tensor dimensions before indexing to prevent device-side assertions
-    if q_nope.shape != (bsz, num_heads, q_len, qk_nope_head_dim):
-        raise RuntimeError(
-            f"q_nope shape mismatch: got {q_nope.shape}, expected {(bsz, num_heads, q_len, qk_nope_head_dim)}"
-        )
-    if q_pe.shape[-1] != q_head_dim - qk_nope_head_dim:
-        raise RuntimeError(
-            f"q_pe last dimension mismatch: got {q_pe.shape[-1]}, expected {q_head_dim - qk_nope_head_dim}"
-        )
-    if qk_nope_head_dim > q_head_dim:
-        raise RuntimeError(f"qk_nope_head_dim ({qk_nope_head_dim}) > q_head_dim ({q_head_dim})")
-
-    # Add step-by-step debugging for tensor assignments
-    print(f"Debug: About to assign q_nope to query_states[:, :, :, :{qk_nope_head_dim}]")
-    print(f"Debug: query_states slice shape: {query_states[:, :, :, :qk_nope_head_dim].shape}")
-    print(f"Debug: q_nope shape: {q_nope.shape}")
-
-    try:
-        query_states[:, :, :, :qk_nope_head_dim] = q_nope
-        print("Debug: Successfully assigned q_nope")
-    except Exception as e:
-        print(f"Debug: Error assigning q_nope: {e}")
-        raise
-
-    print(f"Debug: About to assign q_pe to query_states[:, :, :, {qk_nope_head_dim}:]")
-    print(f"Debug: query_states slice shape: {query_states[:, :, :, qk_nope_head_dim:].shape}")
-    print(f"Debug: q_pe shape: {q_pe.shape}")
-
-    try:
-        query_states[:, :, :, qk_nope_head_dim:] = q_pe
-        print("Debug: Successfully assigned q_pe")
-    except Exception as e:
-        print(f"Debug: Error assigning q_pe: {e}")
-        raise
-
-    # return torch.randn_like(hidden_states), None, None
-
-    key_states = k_pe.new_empty(
-        bsz, num_heads, q_len, q_head_dim
-    )  # [bsz, 128, q_len, 192] - [[change this]] new
-    key_states[:, :, :, :qk_nope_head_dim] = k_nope
-    key_states[:, :, :, qk_nope_head_dim:] = k_pe
-
-    # Batched matmul: [bsz, num_heads, q_len, 192] @ [bsz, num_heads, 192, kv_seq_len].transpose(-1, -2)
-    attn_weights = (
-        torch.matmul(query_states, key_states.transpose(-1, -2)) * self.softmax_scale
-    )  # [bsz, num_heads, q_len, kv_seq_len] - [[change this]] new
-
-    if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
-        raise ValueError(
-            f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
-            f" {attn_weights.size()}"
-        )
-    # Apply attention mask (which contains proper causal masking)
-    if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-            )
-        attn_weights = attn_weights + attention_mask
-
-    # return torch.randn_like(hidden_states), None, None
-    # upcast attention to fp32
-    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query_states.dtype
-    )
-
-    # attn_output = torch.matmul(attn_weights, v_batched_t)
-    attn_output = torch.matmul(attn_weights, value_states)
-
-    if attn_output.size() != (bsz, num_heads, q_len, v_head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz, num_heads, q_len, v_head_dim)}, but is"
-            f" {attn_output.size()}"
-        )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
-
-    ##################################################################
-    attn_output = self.o_proj(attn_output)
+    # attn_output = self.o_proj(attn_output)
     if not output_attentions:
         attn_weights = None
 

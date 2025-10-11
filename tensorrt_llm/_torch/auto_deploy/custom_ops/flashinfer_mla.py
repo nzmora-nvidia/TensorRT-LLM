@@ -3,24 +3,20 @@ import torch
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.torch_mla import apply_rotary_pos_emb
 
+WORKSPACE_SIZE = 128 * 1024 * 1024
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
-workspace_size = 128 * 1024 * 1024
 
 
 def get_workspace_buffer(device):
     global global_trtllm_gen_fmha_workspace_buffer
     if global_trtllm_gen_fmha_workspace_buffer is None:
         global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
-            workspace_size, dtype=torch.int8, device=device
+            WORKSPACE_SIZE, dtype=torch.int8, device=device
         )
     return global_trtllm_gen_fmha_workspace_buffer
 
 
-###################################################################################
-
-
-# # @torch.library.custom_op("auto_deploy::torch_deepseek_prefill_no_absorb_attn", mutates_args=())
 @torch.library.custom_op("auto_deploy::flashinfer_deepseek_mla_with_kv_cache", mutates_args=())
 def flashinfer_deepseek_mla_with_kv_cache(
     q_normed_dn: torch.Tensor,  # [bsz, q_len, self.q_lora_rank]
@@ -28,8 +24,10 @@ def flashinfer_deepseek_mla_with_kv_cache(
     k_pe: torch.Tensor,  # [bsz, 1, kv_len, 64]
     sin_cache: torch.Tensor,
     cos_cache: torch.Tensor,
-    wkv_b: torch.Tensor,  # [128 * 256, 512]
-    wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+    wkv_b: torch.Tensor,  # [num_heads * (qk_nope_head_dim+v_head_dim), kv_lora_rank]
+    wq_b: torch.Tensor,  # [num_heads * q_head_dim, q_lora_rank]
+    w_uq_ukv: torch.Tensor,
+    wo_proj: torch.Tensor,  # [hidden_size, num_heads * v_head_dim]
     # METADATA
     q_indptr: torch.Tensor,
     kv_page_indptr: torch.Tensor,
@@ -64,13 +62,6 @@ def flashinfer_deepseek_mla_with_kv_cache(
     If q_seq_len == 1 ==> this is decode-only, otherwise it's mixed prefill+decode
     """
 
-    # v_head_dim = 128
-    # num_heads = 128
-    # candidate = torch.randn(q_normed_dn.shape[0:2] + (num_heads * v_head_dim,)).to(
-    #     device=q_normed_dn.device, dtype=q_normed_dn.dtype
-    # )
-    # return candidate
-
     original_bsz, q_seq_len = q_normed_dn.shape[0:2]
     if original_bsz != 1:
         # This is a decode-only batch
@@ -82,16 +73,19 @@ def flashinfer_deepseek_mla_with_kv_cache(
         position_ids = position_ids.transpose(0, 1).contiguous()
 
     q_normed_dn = q_normed_dn.contiguous()
+
     #
     # From this point on, we treat decode-only and mixed prefill+decode the same
     #
 
     v_head_dim = 128
-    num_heads = 128
     qk_nope_head_dim = 128
-    qk_rope_head_dim = 64
-    q_head_dim = 192
-    # Todo: is q_len even a meaningful variable here?
+    qk_rope_head_dim = k_pe.shape[-1]
+    assert qk_rope_head_dim == 64
+    q_head_dim = qk_rope_head_dim + qk_nope_head_dim
+    assert q_head_dim == 192
+    num_heads = wq_b.shape[0] // q_head_dim
+    assert num_heads == 128
     bsz, q_len, q_lora_rank = q_normed_dn.shape
     ckv_bsz, kv_seq_len, head_dim_ckv = compressed_kv.shape
     kv_lora_rank = head_dim_ckv
@@ -102,34 +96,63 @@ def flashinfer_deepseek_mla_with_kv_cache(
     assert bsz == 1
 
     # NEW - absorbed q_pe prep
-    wq_b_t = (
-        wq_b.transpose(0, 1).reshape(q_lora_rank, num_heads, q_head_dim).contiguous()
-    )  # [q_lora_rank, 128, 192]
-    q_b_proj_q_nope = wq_b_t[:, :, :qk_nope_head_dim].contiguous()  # [q_lora_rank, 128, 128]
-    q_b_proj_q_pe = wq_b_t[:, :, qk_nope_head_dim:].contiguous()  # [q_lora_rank, 128, 64]
-    # q_normed_dn is x * W^DQ
-    # q_nope = (x * W^DQ) * W^UQ (i.e. q_nope up projection)
-    q_nope = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_nope)  # [bsz, 128, q_len, 128]
-    # (x * W^DQ) * W^QR (i.e. q_pe up projection)
-    q_pe = torch.einsum("bsl,lhd->bhsd", q_normed_dn, q_b_proj_q_pe)
+    w_uq_qr = wq_b  # W_{UQ + QR}: wq_b ~ [num_heads * q_head_dim, q_lora_rank]
+    w_uq_qr_t = (
+        w_uq_qr.transpose(0, 1).reshape(q_lora_rank, num_heads, q_head_dim).contiguous()
+    )  # [q_lora_rank, num_heads, q_head_dim]
 
-    wkv_b = wkv_b.view(num_heads, -1, kv_lora_rank)  # [128, 256, 512]
-    w_ukv = wkv_b[:, :qk_nope_head_dim].contiguous()  # W^UKV ~ [128, 128, 512]
+    w_uq = w_uq_qr_t[
+        :, :, :qk_nope_head_dim
+    ].contiguous()  # [q_lora_rank, num_heads, qk_nope_head_dim]
+    w_qr = w_uq_qr_t[
+        :, :, qk_nope_head_dim:
+    ].contiguous()  # [q_lora_rank, num_heads, qk_rope_head_dim]
+
+    w_ukv_kr = wkv_b
+    w_ukv_kr = wkv_b.view(
+        num_heads, -1, kv_lora_rank
+    )  # [num_heads, qk_nope_head_dim+v_head_dim, kv_lora_rank]
+    w_ukv = w_ukv_kr[
+        :, :qk_nope_head_dim, :
+    ].contiguous()  # W_UKV = [num_heads, qk_nope_head_dim, kv_lora_rank]
+    w_kr = w_ukv_kr[:, -v_head_dim:]
+
+    # q_normed_dn is x * W^DQ
+    # (x * W^DQ) * W^QR (i.e. q_pe up projection)
+    q_pe = torch.einsum("bsl,lhd->bhsd", q_normed_dn, w_qr)
 
     # Weight absorption: (c_Q * W^UQ) * W^UKV
-    # q_nope is already c_Q * W^UQ
-    q_nope = q_nope.transpose(1, 2).contiguous()  # [bsz, q_len, 128, 128]
-    q_nope_absorbed = torch.einsum("bshd,hdc->bshc", q_nope, w_ukv)
-    q_nope = None  # [bsz, q_len, 128, 512]
+    # q_nope = (x * W^DQ) * W^UQ (i.e. q_nope up projection)
+    if False:
+        # Weight absorption: (c_Q * W^UQ) * W^UKV
+        # q_nope = (x * W^DQ) * W^UQ (i.e. q_nope up projection)
+        # q_normed_dn ~ [bsz, q_len, q_lora_rank]
+        q_nope = torch.einsum(
+            "bsl,lhd->bhsd", q_normed_dn, w_uq
+        )  # [bsz, num_heads, q_len, qk_nope_head_dim]
+
+        # Weight absorption: (c_Q * W^UQ) * W^UKV
+        # q_nope is already c_Q * W^UQ
+        q_nope = q_nope.transpose(1, 2).contiguous()  # [bsz, q_len, num_heads, qk_nope_head_dim]
+        q_nope_absorbed = torch.einsum(
+            "bshd,hdc->bshc", q_nope, w_ukv
+        )  # [bsz, q_len, num_heads, kv_lora_rank]
+        q_nope = None  # [bsz, q_len, 128, 512]
+    else:
+        # Pre computed weight absorption: W_UQ * W_UKV
+        # w_uq_ukv = torch.einsum("qhd,hdk->qhk", w_uq, w_ukv) # [q_lora_rank, num_heads, kv_lora_rank]
+
+        q_nope_absorbed = torch.einsum(
+            "bsq,qhk->bshk", q_normed_dn, w_uq_ukv
+        )  # [bsz, q_len, num_heads, kv_lora_rank]
+        q_nope = None  # [bsz, q_len, 128, 512]
 
     assert position_ids is not None
     q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos_cache, sin_cache, position_ids)
     q_pe = q_pe.transpose(1, 2).contiguous()
     k_pe = k_pe.squeeze(1)  # [bsz, kv_seq_len, 64]
 
-    #############################
     # Store the tokens in the cache, after adding position information
-
     flashinfer.append_paged_mla_kv_cache(
         compressed_kv.reshape(-1, head_dim_ckv),
         k_pe.reshape(-1, qk_rope_head_dim),
@@ -141,8 +164,6 @@ def flashinfer_deepseek_mla_with_kv_cache(
         kv_page_indptr,  # The indptr of the paged kv-cache, shape: [batch_size + 1].
         kv_last_page_len,  # The number of entries in the last page of each request in the paged kv cache, shape: [batch_size].
     )
-
-    #############################
 
     # https://sourcegraph.com/github.com/flashinfer-ai/flashinfer/-/blob/tests/test_hopper.py?L130-132
     backend = "auto"
@@ -185,11 +206,13 @@ def flashinfer_deepseek_mla_with_kv_cache(
     assert not torch.isnan(o).any()  # wrong shapes will yield nans
 
     # Weight absorption: W^UV_O
-    attn_output = torch.einsum("bhc,hdc->bhd", o, wkv_b[:, -v_head_dim:])  # [bsz * q_len, 128, 128]
+    attn_output = torch.einsum("bhc,hdc->bhd", o, w_kr)  # [bsz * q_len, 128, 128]
     attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
 
     if original_bsz != 1:
         attn_output = attn_output.transpose(0, 1)
+    # wo_proj is [hidden_size, num_heads * v_head_dim]
+    attn_output = torch.einsum("bsd,td->bst", attn_output, wo_proj)  # wo_proj(attn_output)
     return attn_output
 
 
@@ -202,6 +225,8 @@ def flashinfer_deepseek_mla_with_kv_cache_fake(
     cos_cache: torch.Tensor,
     wkv_b: torch.Tensor,  # [128 * 256, 512]
     wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+    w_uq_ukv: torch.Tensor,
+    wo_proj: torch.Tensor,  # [hidden_size, num_heads * v_head_dim]
     # METADATA
     q_indptr: torch.Tensor,
     paged_kv_indptr: torch.Tensor,
@@ -220,18 +245,17 @@ def flashinfer_deepseek_mla_with_kv_cache_fake(
     # attention_mask: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    v_head_dim = 128
-    num_heads = 128
-    bsz, q_len, q_lora_rank = q_normed_dn.shape
+    hidden_size = wo_proj.shape[0]
+    bsz, q_len, _ = q_normed_dn.shape
 
-    attn_output = torch.empty(bsz, q_len, num_heads * v_head_dim).to(
+    attn_output = torch.empty(bsz, q_len, hidden_size).to(
         device=q_normed_dn.device, dtype=q_normed_dn.dtype
     )
     return attn_output
 
 
 #############################################################################################
-# Usused reference
+# Unused reference
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_deepseek_mla_no_cache", mutates_args=())
@@ -243,6 +267,8 @@ def flashinfer_deepseek_mla_no_cache(
     cos_cache: torch.Tensor,
     wkv_b: torch.Tensor,  # [128 * 256, 512]
     wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+    w_uq_ukv: torch.Tensor,
+    wo_proj: torch.Tensor,  # [hidden_size, num_heads * v_head_dim]
     position_ids: torch.Tensor,
     # CONSTANTS
     softmax_scale: float,
@@ -342,6 +368,7 @@ def flashinfer_deepseek_mla_no_cache(
         )
 
     attn_output = attn_output.reshape(bsz, q_len, num_heads * v_head_dim)
+    attn_output = torch.einsum("bsd,td->bst", attn_output, wo_proj)  # wo_proj(attn_output)
     return attn_output
 
 
@@ -354,17 +381,18 @@ def flashinfer_deepseek_mla_no_cache_fake(
     cos_cache: torch.Tensor,
     wkv_b: torch.Tensor,  # [128 * 256, 512]
     wq_b: torch.Tensor,  # [self.num_heads * self.q_head_dim, self.q_lora_rank]
+    w_uq_ukv: torch.Tensor,
+    wo_proj: torch.Tensor,  # [hidden_size, num_heads * v_head_dim]
     # METADATA
     position_ids: torch.Tensor,
     # CONSTANTS
     # attention_mask: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    v_head_dim = 128
-    num_heads = 128
-    bsz, q_len, q_lora_rank = q_normed_dn.shape
+    hidden_size = wo_proj.shape[0]
+    bsz, q_len, _ = q_normed_dn.shape
 
-    attn_output = torch.empty(bsz, q_len, num_heads * v_head_dim).to(
+    attn_output = torch.empty(bsz, q_len, hidden_size).to(
         device=q_normed_dn.device, dtype=q_normed_dn.dtype
     )
     return attn_output

@@ -119,6 +119,8 @@ transforms:
     stage: cache_init
   insert_cached_attention:
     stage: cache_init
+  absorb_mla_weights:
+    stage: cache_init
   insert_cached_mla_attention:
     stage: cache_init
     attn_backend: TorchMLABackend

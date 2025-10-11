@@ -222,12 +222,7 @@ class TorchMLABackend(AttentionDescriptor):
     @classmethod
     def get_num_qkv_args(cls) -> int:
         """Get the number of qkv arguments expected by the source op."""
-        # return 3
-        # Either:
-        # 1. 4 (q_nope, q_pe, compressed_kv, k_pe)
-        # 2. 3 (q_normed_dn, compressed_kv, k_pe)
-
-        return 7  # sin_cache, cos_cache, wkv_b, wq_b
+        return 9  # (q_normed_dn, compressed_kv, k_pe), (sin_cache, cos_cache), (wkv_b, wq_b, w_uq_ukv, wo_proj)
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
@@ -248,13 +243,7 @@ class TorchMLABackend(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: CacheConfig
     ) -> CacheInitializerDict:
-        # q_nope_fake = source_attn_node.args[0].meta["val"]
-        # q_pe_fake = source_attn_node.args[1].meta["val"]
         kv_fake = source_attn_node.args[2].meta["val"]
-
-        # num_kv_heads = kv_fake.shape[1]
-        # head_dim = q_nope_fake.shape[-1]
-        # rope_dim = q_pe_fake.shape[-1]
 
         def _create_linear_caches(
             max_batch_size: int,
