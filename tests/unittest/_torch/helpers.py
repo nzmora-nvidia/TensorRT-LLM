@@ -11,7 +11,6 @@ def ceil_div(x: int, y: int) -> int:
 def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
-
 def ceil_to_ue8m0(x: torch.Tensor):
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
@@ -90,7 +89,31 @@ def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
 
 def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
                         final_scales: torch.Tensor, num_experts: int,
-                        weights: Dict[str, torch.Tensor]) -> torch.Tensor:
+                        weights: Dict[str, torch.Tensor],
+                        mlp_style: str = "gated_mlp",  # "gated_mlp" (default) or "mlp"
+                        act_fn: str = "silu",  # silu or relu2
+) -> torch.Tensor:
+    def _resolve_activation(name: str):
+        """
+        Returns an elementwise activation callable matching the given name.
+        Supported: "silu", "relu2".
+        Defaults to SiLU when name is None or empty.
+        """
+        if not name:
+            name = "silu"
+        key = name.lower()
+
+        if key == "silu":
+            return F.silu
+        elif key == "relu2":
+            def relu2(x: torch.Tensor) -> torch.Tensor:
+                return torch.square(F.relu(x))
+            return relu2
+        else:
+            raise ValueError(f"Unsupported activation '{name}'. Use one of: silu, relu2.")
+
+    act_fn = _resolve_activation(act_fn)
+    mlp_style = mlp_style.lower()
     # cast back to the input dtype
     results = torch.zeros_like(x)
 
@@ -101,8 +124,14 @@ def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
         w2_weight = weights[f"{expert_id}.w2.weight"]
         w3_weight = weights[f"{expert_id}.w3.weight"]
         expert_inputs = x[batch_idx]
-        output = (F.silu(expert_inputs @ w1_weight.t()) *
-                  (expert_inputs @ w3_weight.t())) @ w2_weight.t()
+        if mlp_style == "gated_mlp":
+            output = (act_fn(expert_inputs @ w1_weight.t()) *
+                      (expert_inputs @ w3_weight.t())) @ w2_weight.t()
+        elif mlp_style == "mlp":
+            output = act_fn(expert_inputs @ w1_weight.t()) @ w2_weight.t()
+        else:
+            raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use one of: gated_mlp, mlp.")
+
         results[batch_idx] += final_scales[batch_idx, nth_expert, None] * output
 
     return results.view_as(x)

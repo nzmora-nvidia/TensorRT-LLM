@@ -4,17 +4,18 @@ import torch.nn.functional as F
 from _torch.helpers import reference_moe_torch
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
-from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
+# Each one of these includes causes a segmentation fault i nthe culass fp8 moe kernel
+# import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+# from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
+# from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
 
 def setup_moe_test(dtype, num_experts):
     SEQ_LEN = 8
-    HIDDEN_SIZE = 64
-    INTERMEDIATE_SIZE = 32
+    HIDDEN_SIZE = 2688  # 64
+    INTERMEDIATE_SIZE = 1856  # 32
     NUM_EXPERTS = num_experts
-    TOP_K = 2
+    TOP_K = min(num_experts, 6)
 
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)  # seed=0 will fail
