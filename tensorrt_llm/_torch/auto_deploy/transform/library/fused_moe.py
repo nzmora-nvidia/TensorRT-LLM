@@ -38,6 +38,7 @@ def _insert_fused_moe_ops(gm: GraphModule, backend: Literal["auto", "trtllm", "t
         "triton": torch.ops.auto_deploy.triton_moe_fused,
     }[backend]
 
+    # assert False, "quak 00"
     for node in graph.nodes:
         if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue

@@ -160,25 +160,41 @@ class VisionTransformerLikeModel(nn.Module):
 
 
 class Expert(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, mlp_style: str):
         super().__init__()
         self.w1 = nn.Parameter(torch.randn(intermediate_size, hidden_size))
         self.w2 = nn.Parameter(torch.randn(hidden_size, intermediate_size))
-        self.w3 = nn.Parameter(torch.randn(intermediate_size, hidden_size))
+        if mlp_style == "gated_mlp":
+            self.w3 = nn.Parameter(torch.randn(intermediate_size, hidden_size))
+        else:
+            self.w3 = None
 
 
 class MoEOpModel(nn.Module):
-    def __init__(self, hidden_size=32, intermediate_size=16, num_experts=4, top_k=2):
+    def __init__(
+        self,
+        hidden_size=32,
+        intermediate_size=16,
+        num_experts=4,
+        top_k=2,
+        mlp_style=None,
+        act_fn=None,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.top_k = top_k
+        self.mlp_style = mlp_style
+        self.act_fn = act_fn
 
-        self.gate = nn.Linear(hidden_size, num_experts)
+        if mlp_style == "gated_mlp":
+            self.gate = nn.Linear(hidden_size, num_experts)
+        else:
+            self.gate = None
 
         self.experts = nn.ModuleList(
-            [Expert(hidden_size, intermediate_size) for _ in range(num_experts)]
+            [Expert(hidden_size, intermediate_size, mlp_style) for _ in range(num_experts)]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -187,7 +203,10 @@ class MoEOpModel(nn.Module):
         Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
-        router_logits = self.gate(x)
+        if self.gate is not None:
+            router_logits = self.gate(x)
+        else:
+            router_logits = x
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
@@ -195,10 +214,20 @@ class MoEOpModel(nn.Module):
 
         w1_list = [expert.w1 for expert in self.experts]
         w2_list = [expert.w2 for expert in self.experts]
-        w3_list = [expert.w3 for expert in self.experts]
+        if self.mlp_style == "gated_mlp":
+            w3_list = [expert.w3 for expert in self.experts]
+        else:
+            w3_list = []
 
         out = torch.ops.auto_deploy.torch_moe(
-            x, selected_experts, routing_weights, w1_list, w2_list, w3_list
+            x,
+            selected_experts,
+            routing_weights,
+            w1_list,
+            w2_list,
+            w3_list,
+            mlp_style=self.mlp_style,
+            act_fn=self.act_fn,
         )
         return out
 

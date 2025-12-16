@@ -165,7 +165,7 @@ HIDDEN_SIZES = [
 NUM_EXPERTS = [2]
 TOP_K_VALUES = [2]
 INTERMEDIATE_SIZES = [
-    128,
+    256,
 ]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
@@ -630,11 +630,16 @@ def test_trtllm_fused_moe_nvfp4(
         w3_blockscale = torch.empty(
             (num_experts, sf_w3_n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
         )
-        w1_q = torch.empty((num_experts, w1_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
-        w2_q = torch.empty(
+        # Creates fp4 weights packed as uint8 (each 2 fp4 elements are packed into one uint8)
+        w1_packed = torch.empty(
+            (num_experts, w1_n, hidden_size // 2), device="cuda", dtype=torch.uint8
+        )
+        w2_packed = torch.empty(
             (num_experts, hidden_size, intermediate_size // 2), device="cuda", dtype=torch.uint8
         )
-        w3_q = torch.empty((num_experts, w3_n, hidden_size // 2), device="cuda", dtype=torch.uint8)
+        w3_packed = torch.empty(
+            (num_experts, w3_n, hidden_size // 2), device="cuda", dtype=torch.uint8
+        )
 
         w1_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
         w2_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
@@ -651,31 +656,41 @@ def test_trtllm_fused_moe_nvfp4(
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
                 w1[expert], w1_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
             )
-            w1_q[expert] = nvfp4_vals
+            w1_packed[expert] = nvfp4_vals
             w1_blockscale[expert] = fp8_block_scales.reshape(w1_blockscale[expert].shape)
 
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
                 w2[expert], w2_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
             )
-            w2_q[expert] = nvfp4_vals
+            w2_packed[expert] = nvfp4_vals
             w2_blockscale[expert] = fp8_block_scales.reshape(w2_blockscale[expert].shape)
 
             nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
                 w3[expert], w3_gs[expert], NVFP4_BLOCK_SIZE, isSfSwizzledLayout=True
             )
-            w3_q[expert] = nvfp4_vals
+            w3_packed[expert] = nvfp4_vals
             w3_blockscale[expert] = fp8_block_scales.reshape(w3_blockscale[expert].shape)
 
-        return w1_q, w2_q, w3_q, w1_blockscale, w2_blockscale, w3_blockscale, w1_gs, w2_gs, w3_gs
+        return (
+            w1_packed,
+            w2_packed,
+            w3_packed,
+            w1_blockscale,
+            w2_blockscale,
+            w3_blockscale,
+            w1_gs,
+            w2_gs,
+            w3_gs,
+        )
 
     x, w1, w2, w3, router_logits = _get_test_data(
         otype, batch_size, hidden_size, num_experts, intermediate_size
     )
 
     (
-        w1_q_fp4,
-        w2_q_fp4,
-        w3_q_fp4,
+        w1_packed_fp4,
+        w2_packed_fp4,
+        w3_packed_fp4,
         w1_blockscale,
         w2_blockscale,
         w3_blockscale,
@@ -696,7 +711,7 @@ def test_trtllm_fused_moe_nvfp4(
     mlp_style = "mlp" if activation_func == "relu2" else "gated_mlp"
     if mlp_style == "gated_mlp":
         # For gated MLP, concatenate w1 and w3 as [w3, w1]
-        fc1_expert_weights_fp4 = torch.cat([w3_q_fp4, w1_q_fp4], dim=1).contiguous()
+        fc1_expert_weights_fp4 = torch.cat([w3_packed_fp4, w1_packed_fp4], dim=1).contiguous()
         fc1_weight_blockscale_fp8 = torch.cat([w3_blockscale, w1_blockscale], dim=1)
         fc1_weight_gs = torch.max(w3_gs, w1_gs)
         if activation_func != "silu":
@@ -705,7 +720,7 @@ def test_trtllm_fused_moe_nvfp4(
             )
     elif mlp_style == "mlp":
         # For non-gated MLP with ReLU^2
-        fc1_expert_weights_fp4 = w1_q_fp4
+        fc1_expert_weights_fp4 = w1_packed_fp4
         fc1_weight_blockscale_fp8 = w1_blockscale.view(torch.long)
         fc1_weight_gs = w1_gs
         if activation_func != "relu2":
@@ -713,7 +728,7 @@ def test_trtllm_fused_moe_nvfp4(
     else:
         raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
-    fc2_expert_weights_fp4 = w2_q_fp4.view(torch.long)
+    fc2_expert_weights_fp4 = w2_packed_fp4.view(torch.long)
     fc2_weight_blockscale_fp8 = w2_blockscale.view(torch.long)
     fc1_expert_weights_fp4 = fc1_expert_weights_fp4.view(torch.long)
 
@@ -758,7 +773,7 @@ def test_trtllm_fused_moe_nvfp4(
         # Dequantize the weights to emulate the precision loss.
         for idx in range(0, num_experts):
             w1_dq[idx] = dequantize_nvfp4_to_dtype(
-                w1_q_fp4[idx],
+                w1_packed_fp4[idx],
                 w1_blockscale[idx],
                 w1_gs[idx],
                 dtype=w1.dtype,
@@ -766,7 +781,7 @@ def test_trtllm_fused_moe_nvfp4(
                 block_size=NVFP4_BLOCK_SIZE,
             )
             w2_dq[idx] = dequantize_nvfp4_to_dtype(
-                w2_q_fp4[idx],
+                w2_packed_fp4[idx],
                 w2_blockscale[idx],
                 w2_gs[idx],
                 dtype=w2.dtype,
@@ -774,7 +789,7 @@ def test_trtllm_fused_moe_nvfp4(
                 block_size=NVFP4_BLOCK_SIZE,
             )
             w3_dq[idx] = dequantize_nvfp4_to_dtype(
-                w3_q_fp4[idx],
+                w3_packed_fp4[idx],
                 w3_blockscale[idx],
                 w3_gs[idx],
                 dtype=w3.dtype,

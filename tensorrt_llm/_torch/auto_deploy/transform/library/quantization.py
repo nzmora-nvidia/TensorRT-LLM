@@ -330,7 +330,7 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
+            "weight_scale": torch.empty(padded_m, padded_n, dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
 
