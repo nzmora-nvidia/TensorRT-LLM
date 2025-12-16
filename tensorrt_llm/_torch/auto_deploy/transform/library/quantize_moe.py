@@ -1,15 +1,16 @@
 from functools import partial
-from typing import Callable, List, Tuple
+from typing import Callable, List, Literal, Tuple, Type
 
 import torch
 import torch.nn as nn
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import should_skip_quantization
-from ..interface import SharedConfig, TransformInfo, TransformRegistry
+from ..interface import SharedConfig, TransformConfig, TransformInfo, TransformRegistry
 from .quantization import (
     FP8LinearQuantizationFromConfig,
     NVFP4LinearQuantizationFromConfig,
@@ -29,6 +30,9 @@ def _quantize_moe_node(
     Replace a torch.ops.auto_deploy.torch_moe node with its quantized version,
     quantizing each expert weight list and registering scales + hooks.
     Automatically handles different scale configurations per quantization type.
+
+    When pre_process_params is True, the weights are concatenated and stacked during the
+    model optimization stage. Otherwise, the weights are quantized and stacked during inference.
     """
     w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
 
@@ -355,6 +359,15 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
         return gm, info
 
 
+class FuseFp4MoeConfig(TransformConfig):
+    """Configuration for MoE fusion transform."""
+
+    backend: str = Field(
+        default="auto",
+        description="Backend to use for FP4 MoE computation ('auto', 'trtllm' or 'torch'. default: 'auto').",
+    )
+
+
 @TransformRegistry.register("quantize_nvfp4_moe")
 class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
     """
@@ -362,12 +375,25 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
     quantized version using the quant_algo from quant_config.
     """
 
-    def target_op(self, backend: str):
-        if backend.lower() == "trtllm":
-            return torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused
-        else:
-            return torch.ops.auto_deploy.torch_quant_nvfp4_moe
-        # return torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseFp4MoeConfig
+
+    @property
+    def backend(self) -> Literal["auto", "trtllm", "torch"]:
+        # Read the backend from the config file (tensorrt_llm/_torch/auto_deploy/transform/library/quantize_moe.py)
+        backend = self.config.backend.lower()
+        assert backend in ["auto", "trtllm", "torch"], f"Invalid backend: {backend}"
+        return backend
+
+    def target_op(self, backend: Literal["auto", "trtllm", "triton"]):
+        backend = backend.lower()
+        replacement_op = {
+            "auto": torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+            "trtllm": torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
+            "torch": torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+        }[backend]
+        return replacement_op
 
     def _apply(
         self,
@@ -383,7 +409,6 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        backend = qcfg.get("backend", "auto")
         excluded_patterns = qcfg.get("exclude_modules", [])
         count = 0
 
@@ -399,12 +424,11 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
             ):
                 continue
 
-            target_op = self.target_op(backend)
-            if target_op == torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused:
-                _quantize_moe_node(gm, node, self, target_op, count, pre_process_params=True)
-            else:
-                _quantize_moe_node(gm, node, self, target_op, count, pre_process_params=False)
-            #            _quantize_moe_node(gm, node, self, self.target_op(), count)
+            target_op = self.target_op(self.backend)
+            pre_process_param = target_op == torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused
+            _quantize_moe_node(
+                gm, node, self, target_op, count, pre_process_params=pre_process_param
+            )
             count += 1
 
         info = TransformInfo(

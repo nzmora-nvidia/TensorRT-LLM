@@ -77,6 +77,7 @@ def test_quantize_moe_transformation(
             },
             "quantize_nvfp4_moe": {
                 "stage": "pattern_matcher",
+                "backend": backend,
             },
         },
     )(None, gm)

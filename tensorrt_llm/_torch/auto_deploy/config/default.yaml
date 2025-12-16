@@ -73,6 +73,7 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_moe:
     stage: pattern_matcher
+    backend: trtllm
   quantize_mxfp4_moe:
     stage: pattern_matcher
   detect_sharding:
