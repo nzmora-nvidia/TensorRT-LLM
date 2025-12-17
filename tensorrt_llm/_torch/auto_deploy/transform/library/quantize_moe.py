@@ -40,24 +40,20 @@ def _quantize_moe_node(
 
     def extract_mlp_style_and_act_fn(node: Node) -> Tuple[str, str]:
         # These can be in args[6:] or in kwargs
-        mlp_style = (
-            node.args[6]
-            if len(node.args) > 6
-            else node.kwargs["mlp_style"]
-            if "mlp_style" in node.kwargs
-            else "gated_mlp"
-        )  # default
         act_fn = "silu"  # default
+        mlp_style = "gated_mlp"  # default
 
         if len(node.args) > 6:
             mlp_style = node.args[6]
         elif "mlp_style" in node.kwargs:
             mlp_style = node.kwargs["mlp_style"]
+        assert mlp_style in ["gated_mlp", "mlp"], f"Unknown mlp_style: {mlp_style}"
 
         if len(node.args) > 7:
             act_fn = node.args[7]
         elif "act_fn" in node.kwargs:
             act_fn = node.kwargs["act_fn"]
+        assert act_fn in ["silu", "relu2"], f"Unknown act_fn: {act_fn}"
 
         return mlp_style, act_fn
 
