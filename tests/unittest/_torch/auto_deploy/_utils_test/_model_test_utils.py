@@ -185,14 +185,10 @@ class MoEOpModel(nn.Module):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.top_k = top_k
-        self.mlp_style = mlp_style
-        self.act_fn = act_fn
+        self.mlp_style = mlp_style or "gated_mlp"
+        self.act_fn = act_fn or "silu"
 
-        if mlp_style == "gated_mlp":
-            self.gate = nn.Linear(hidden_size, num_experts)
-        else:
-            self.gate = None
-
+        self.gate = nn.Linear(hidden_size, num_experts)
         self.experts = nn.ModuleList(
             [Expert(hidden_size, intermediate_size, mlp_style) for _ in range(num_experts)]
         )
@@ -203,10 +199,7 @@ class MoEOpModel(nn.Module):
         Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
-        if self.gate is not None:
-            router_logits = self.gate(x)
-        else:
-            router_logits = x
+        router_logits = self.gate(x)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)

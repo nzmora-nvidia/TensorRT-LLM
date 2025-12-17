@@ -145,6 +145,7 @@ def run_test_transformed_gm(
 
     if strict_loading and not skip_output_assert:
         # check if output equals without loading state dict
+        print(f"After transform: /n{y_model=}/n{y_transformed=}")
         torch.testing.assert_close(y_model, y_transformed, atol=atol, rtol=rtol)
 
     if test_load_hook and not skip_output_assert:

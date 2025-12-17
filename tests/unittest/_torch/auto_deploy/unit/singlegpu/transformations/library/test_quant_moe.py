@@ -32,6 +32,8 @@ def test_quantize_moe_transformation(
     num_experts = 4
     top_k = 2
 
+    torch.manual_seed(42)
+
     model = MoEOpModel(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -41,7 +43,7 @@ def test_quantize_moe_transformation(
         act_fn=act_fn,
     ).to(device=device, dtype=torch.bfloat16)
 
-    x = model.get_input(device=device, dtype=torch.bfloat16)
+    x = model.get_input(device=device, dtype=torch.bfloat16) * 0.01
 
     def _check_transformed_graph(gm):
         return any(is_op(n, expected_op) for n in gm.graph.nodes)
@@ -52,10 +54,7 @@ def test_quantize_moe_transformation(
         For FP4, weights are quantized to half-size (simulate 4-bit).
         """
         # gate: Linear(hidden_size, num_experts)
-        if mlp_style == "gated_mlp":
-            gate_params = (hidden_size + 1) * num_experts  # with bias
-        else:
-            gate_params = 0
+        gate_params = (hidden_size + 1) * num_experts  # with bias
 
         if quant_algo == "NVFP4":
             num_weights = 3 if mlp_style == "gated_mlp" else 2
