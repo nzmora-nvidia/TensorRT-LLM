@@ -257,21 +257,21 @@ def trtllm_quant_fp8_moe_fused_fake(
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_nvfp4_moe_fused", mutates_args=())
 def trtllm_quant_nvfp4_moe_fused(
-    x: torch.Tensor,  # [B, S, H] or [B*S, H], 16-bit float
+    x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
-    fc1_expert_weights_fp4: torch.Tensor,  # [E, 2*I, H] or [E, I, H]; uint8
-    fc2_expert_weights_fp4: torch.Tensor,  # [E, H, I]; uint8
-    fc1_weight_blockscale_fp8: torch.Tensor,  # Global scale for fc1 (scalar)
-    fc2_weight_blockscale_fp8: torch.Tensor,  # Global scale for w2 (scalar)
-    fc1_act_global_scale: torch.Tensor,  # Global scale for FC1 activations
-    fc2_act_global_scale: torch.Tensor,  # Global scale for FC2 activations
-    fc1_alpha: torch.Tensor,  # Precomputed FC1 alpha (1.0 / (fc1_act_global_scale * fc1_weight_blockscale_fp8))
-    fc2_alpha: torch.Tensor,  # Precomputed FC2 alpha (1.0 / (fc2_act_global_scale * fc2_weight_blockscale_fp8))
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc2_act_global_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
     mlp_style: str = "gated_mlp",
     act_fn: str = "silu",
 ) -> torch.Tensor:
-    """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
+    """TensorRT-LLM Cutlass NVFP4 MoE for gated and non-gated MLP.
 
     Computes (per expert):
         For gated_mlp:
@@ -279,10 +279,26 @@ def trtllm_quant_nvfp4_moe_fused(
         For mlp:
             y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
 
+    Notes:
+        - FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
+        - FC2 implements: fc2_output = fc1_output @ w2.T
+        - FC1 weights are concatenated w3 and w1 if gated_mlp, otherwise w1
+        - FP4 elements pairs are packed as a single uint8 element
 
-    FC1 implements: fc1_output = (act(x @ w1.T) * (x @ w3.T)) or fc1_output = act(x @ w1.T)
-    FC2 implements: fc2_output = fc1_output @ w2.T
-
+    Parameters:
+        x: BF16/FP16 input tensor of shape (B, H) or (B, S, H)
+        selected_experts: Expert indices (B*S, TOP_K)
+        routing_weights: Routing weights (B*S, TOP_K)
+        fc1_expert_weights_fp4: FP4 FC1 weights [E, 2*I, H] or [E, I, H]; packed uint8
+        fc2_expert_weights_fp4: FP4 FC2 weights [E, H, I]; packed uint8
+        fc1_weight_blockscale_fp8: Block scales for FC1 weights (w1 or concat of w3 and w1)
+        fc2_weight_blockscale_fp8: Block scales for FC2 weights (w2)
+        fc1_act_global_scale: Global scale for FC1 activations (scalar)
+        fc2_act_global_scale: Global scale for FC2 activations (scalar)
+        fc1_alpha: Precomputed FC1 alpha = 1.0 / (fc1_act_global_scale * fc1_weight_blockscale_fp8)
+        fc2_alpha: Precomputed FC2 alpha = 1.0 / (fc2_act_global_scale * fc2_weight_blockscale_fp8)
+        mlp_style: "gated_mlp" or "mlp"
+        act_fn: "silu" for gated_mlp, "relu2" for mlp
     """
     NVFP4_BLOCK_SIZE = 16
     mlp_style = mlp_style.lower()
@@ -308,7 +324,7 @@ def trtllm_quant_nvfp4_moe_fused(
         fc1_act_global_scale,  # torch.float32; [E] or scalar
         fc1_weight_blockscale_fp8.view(
             torch.int32
-        ),  # 4 FP8 as packed int32; [E, I*2, H / 16 / 4] or [E, I, H / 16 / 4]
+        ),  # 4 FP8 elements packed as int32; [E, I*2, H / 16 / 4] or [E, I, H / 16 / 4]
         fc1_alpha,  # torch.float32; [E]
         fc2_act_global_scale,  # torch.float32; [E] or scalar
         fc2_weight_blockscale_fp8.view(torch.int32),  # 4 FP8 as packed int32; [E, H, I / 16 / 4]

@@ -28,7 +28,7 @@ def test_quantize_moe_transformation(
 ):
     device = "cuda"
     hidden_size = 128
-    intermediate_size = 256
+    intermediate_size = 1856  # From Nemotron Nano
     num_experts = 4
     top_k = 2
 

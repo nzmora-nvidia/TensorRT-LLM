@@ -73,7 +73,7 @@ class Quantization(BaseTransform):
         return []
 
     @staticmethod
-    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+    def default_scales(original_weight_shape: Tuple, **kwargs) -> Dict[str, torch.Tensor]:
         """Returns a dict of the default scale values for this quantization."""
         return {}
 
@@ -280,7 +280,7 @@ class FP8LinearQuantizationFromConfig(Quantization):
     def scale_names(self) -> List[str]:
         return ["input_scale", "weight_scale"]
 
-    def default_scales(self, _shape: Tuple) -> Dict[str, torch.Tensor]:
+    def default_scales(self, _shape: Tuple, **kwargs) -> Dict[str, torch.Tensor]:
         return {"input_scale": torch.tensor(1.0), "weight_scale": torch.tensor(1.0)}
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
@@ -317,7 +317,9 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
     def scale_names(self) -> List[str]:
         return ["input_scale", "weight_scale", "alpha"]
 
-    def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+    def default_scales(
+        self, original_weight_shape: Tuple, flatten_block_scale: bool = True
+    ) -> Dict[str, torch.Tensor]:
         m, n = original_weight_shape
         # scaling factors m is padded along 128 and n is padded along 4.
         # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
@@ -328,9 +330,13 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # input_scale: FP4_GLOBAL_SCALE_MAX / input_amax
         # weight_scale_2: FP4_GLOBAL_SCALE_MAX / weight_amax
         # alpha: 1 / (input_scale * weight_scale_2)
+        if flatten_block_scale:
+            weight_scale = torch.empty(padded_m * padded_n, dtype=torch.uint8)
+        else:
+            weight_scale = torch.empty(m, n, dtype=torch.float8_e4m3fn)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty(padded_m, padded_n, dtype=torch.uint8),
+            "weight_scale": weight_scale,
             "alpha": torch.tensor(1.0 / 6.0),
         }
 

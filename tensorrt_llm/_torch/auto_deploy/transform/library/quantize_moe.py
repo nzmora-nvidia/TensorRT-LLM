@@ -64,6 +64,9 @@ def _quantize_moe_node(
     def quantize_param_list(weight_names: List[str]) -> Tuple[List[Node], List[List[Node]]]:
         new_attrs = []
         scale_nodes_group = []
+        # The torch implementation requires the block scales to be flattened, but the TRT-LLM implementation
+        # requires them to be in the original shape.
+        flatten_block_scale = quantized_op == torch.ops.auto_deploy.torch_quant_nvfp4_moe
         for name in weight_names:
             orig_weight = gm.get_parameter(name)
             new_weight = quant_impl.quantize_weight(orig_weight)
@@ -74,7 +77,10 @@ def _quantize_moe_node(
             setattr(submod, attrname, nn.Parameter(new_weight, requires_grad=False))
 
             # Register new scale buffers
-            for scale_name, scale_val in quant_impl.default_scales(orig_weight.shape).items():
+            scales_dict = quant_impl.default_scales(
+                orig_weight.shape, flatten_block_scale=flatten_block_scale
+            )
+            for scale_name, scale_val in scales_dict.items():
                 submod.register_buffer(scale_name, scale_val)
 
             # Register load hook
@@ -102,6 +108,7 @@ def _quantize_moe_node(
         fc1_weight_blockscale_fp8 = torch.stack(
             [gm.get_buffer(n.target) for n in w1_weight_blockscale_fp8], dim=0
         )
+
     # w1_attrs = [experts_0_w1_1, experts_1_w1_1, experts_2_w1_1]
     # w1_scales = [[experts_0_input_scale, experts_0_weight_scale, experts_0_alpha],
     # [experts_1_input_scale, experts_1_weight_scale, experts_1_alpha],
@@ -251,7 +258,7 @@ def _quantize_moe_node(
             fc1_alpha_attr,
             fc2_alpha_attr,
         ]
-        # quantized_op = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused
+
         # Replace the current node with the quantized version
         with gm.graph.inserting_after(node):
             new_node = gm.graph.call_function(
