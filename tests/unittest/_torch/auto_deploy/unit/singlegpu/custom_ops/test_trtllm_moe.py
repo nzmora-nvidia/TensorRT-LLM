@@ -709,9 +709,8 @@ def test_trtllm_fused_moe_nvfp4(
     else:
         raise ValueError(f"Unknown mlp_style '{mlp_style}'. Use 'gated_mlp' or 'mlp'.")
 
-    fc2_expert_weights_fp4 = w2_q_fp4.view(torch.long)
-    fc2_weight_blockscale_fp8 = w2_blockscale.view(torch.long)
-    fc1_expert_weights_fp4 = fc1_expert_weights_fp4.view(torch.long)
+    fc2_expert_weights_fp4 = w2_q_fp4
+    fc2_weight_blockscale_fp8 = w2_blockscale
 
     trtllm_output = torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused(
         x,
