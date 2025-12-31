@@ -339,9 +339,6 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
             "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.uint8),
-            # "weight_scale": torch.empty((m, n), dtype=torch.uint8),
-            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
-            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
 
@@ -387,6 +384,7 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     # Round the weight block scale factors to 128x4 and then swizzle.
+                    # REMOVE THIS SWIZZLING
                     weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
                         weight_scale.view(torch.uint8).cpu().contiguous()
                     ).view(float4_sf_dtype)

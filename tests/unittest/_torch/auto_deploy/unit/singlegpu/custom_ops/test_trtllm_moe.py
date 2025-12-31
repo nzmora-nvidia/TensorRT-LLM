@@ -484,7 +484,10 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
             inter = act(w1[i], mask)
             inter_gs = torch.tensor(1.0).cuda()
             inter_q, inter_blockscale = torch.ops.trtllm.fp4_quantize(
-                inter, inter_gs, NVFP4_BLOCK_SIZE
+                inter,
+                inter_gs,
+                NVFP4_BLOCK_SIZE,
+                isSfSwizzledLayout=False,
             )
             inter = dequantize_nvfp4_to_dtype(
                 inter_q,
@@ -493,13 +496,16 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
                 dtype=inter.dtype,
                 device=inter.device,
                 block_size=NVFP4_BLOCK_SIZE,
+                is_swizzled=False,
             ).cuda()
             out[mask] = inter @ w2[i].transpose(0, 1)
     return (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
 
 
 # Originally from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/moe/test_trtllm_cutlass_fused_moe.py
-def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device, block_size=16):
+def dequantize_nvfp4_to_dtype(
+    tensor_fp4, tensor_sf, global_scale, dtype, device, block_size=16, is_swizzled=False
+):
     """Dequantize the fp4 tensor back to high precision."""
 
     def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
@@ -508,6 +514,7 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
         k_tiles = (k + f - 1) // f
         tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
         tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
+        assert (k_tiles * f) % block_size == 0
         out = tmp.reshape(m_tiles * TRTLLM_NVFP4_ROW_SIZE, k_tiles * f // block_size)
         return out[0:m, 0:k]
 
@@ -543,7 +550,8 @@ def dequantize_nvfp4_to_dtype(tensor_fp4, tensor_sf, global_scale, dtype, device
     tensor_f32 = break_fp4_bytes(tensor_fp4, dtype)
     tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
     tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
-    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
+    if is_swizzled:
+        tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
     tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
 
     # scale the tensor
@@ -555,7 +563,8 @@ NVFP4_TEST_DTYPES = [torch.float16, torch.bfloat16]
 
 FP4_TEST_SHAPES = [
     (128, 128),  # Trivial test case (no padding required)
-    (2688, 1856),  # Nemotron-Nano-3-30B-A3 sizes (padding required)
+    (2688, 1856),  # Nemotron-Nano-3-30B-A3 sizes (padding required
+    (2688, 1920),  # Like Nemotron-Nano-3-30B-A3 sizes, but without padding
 ]
 
 # Scale the input and weights to prevent large absolute values.
@@ -583,10 +592,10 @@ def test_trtllm_fused_moe_nvfp4(
     activation_func,
 ):
     # Skip known failing configuration
-    if activation_func == ActivationType.Relu2 and intermediate_size == 1856:
-        pytest.skip(
-            "test fails for Relu2 with intermediate_size=1856; see https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
-        )
+    # if activation_func == ActivationType.Relu2 and intermediate_size == 1856:
+    #     pytest.skip(
+    #         "test fails for Relu2 with intermediate_size=1856; see https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
+    #     )
 
     # In the code below:
     #   sf := block scale factors for NVFP4
@@ -622,25 +631,23 @@ def test_trtllm_fused_moe_nvfp4(
         return x, fc1_weights, fc2_weights, router_logits
 
     def _quantize_weights(fc1_weights, fc2_weights, is_gated_mlp):
-        def round_up(x, y):
-            return math.ceil(x / y) * y
-
         fc1_weights_n = fc1_weights.shape[1]
-        sf_fc1_weights_n = round_up(fc1_weights_n, TRTLLM_NVFP4_ROW_SIZE)
-        sf_fc1_weights_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
+        sf_fc1_weights_n = fc1_weights_n
+        sf_fc1_weights_k = hidden_size // NVFP4_BLOCK_SIZE
         fc1_weights_blockscale = torch.empty(
             (num_experts, sf_fc1_weights_n, sf_fc1_weights_k),
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
-        sf_fc2_weights_k = round_up(hidden_size, TRTLLM_NVFP4_ROW_SIZE)
-        sf_fc2_weights_n = round_up(intermediate_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
+        sf_fc2_weights_k = hidden_size
+        sf_fc2_weights_n = intermediate_size // NVFP4_BLOCK_SIZE
         fc2_weights_blockscale = torch.empty(
             (num_experts, sf_fc2_weights_k, sf_fc2_weights_n),
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
 
+        # Quantized weights are packed as uint8 (each 2 fp4 elements are packed into one uint8)
         fc1_weights_q = torch.empty(
             (num_experts, fc1_weights_n, hidden_size // 2), device="cuda", dtype=torch.uint8
         )
@@ -648,8 +655,22 @@ def test_trtllm_fused_moe_nvfp4(
             (num_experts, hidden_size, intermediate_size // 2), device="cuda", dtype=torch.uint8
         )
 
+        # Global scale factors for the weights
         fc1_weights_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
         fc2_weights_gs = torch.empty((num_experts,), device="cuda", dtype=torch.float32)
+
+        def _quantize_expert(weights, weights_blockscale, weights_gs):
+            # Quantize the weights to NVFP4. Block scale factors are not swizzled yet because
+            # we will swizzle them later, after padding (if padding is required).
+            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
+                weights,
+                weights_gs,
+                NVFP4_BLOCK_SIZE,
+                isSfSwizzledLayout=False,
+            )
+            weights_q = nvfp4_vals
+            weights_blockscale = fp8_block_scales.reshape(weights_blockscale.shape)
+            return weights_q, weights_blockscale
 
         for expert in range(num_experts):
             fc1_weights_amax = torch.abs(fc1_weights[expert]).max().to(torch.float32)
@@ -657,32 +678,14 @@ def test_trtllm_fused_moe_nvfp4(
             fc1_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc1_weights_amax
             fc2_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc2_weights_amax
 
-            # Quantize the weights to NVFP4 and ask for swizzled block scale factors because the
-            # MoE operator expects pre-swizzled block scale factors. Swizzling also flattens the
-            # block scale factors to a 1D tensor.
-            # Note that swizzling might create padded block scales
-            # because the block-scales are required to be padded to the nearest multiple of 128x4.
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                fc1_weights[expert],
-                fc1_weights_gs[expert],
-                NVFP4_BLOCK_SIZE,
-                isSfSwizzledLayout=True,
-            )
-            fc1_weights_q[expert] = nvfp4_vals
-            fc1_weights_blockscale[expert] = fp8_block_scales.reshape(
-                fc1_weights_blockscale[expert].shape
+            fc1_weights_q[expert], fc1_weights_blockscale[expert] = _quantize_expert(
+                fc1_weights[expert], fc1_weights_blockscale[expert], fc1_weights_gs[expert]
             )
 
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                fc2_weights[expert],
-                fc2_weights_gs[expert],
-                NVFP4_BLOCK_SIZE,
-                isSfSwizzledLayout=True,
+            fc2_weights_q[expert], fc2_weights_blockscale[expert] = _quantize_expert(
+                fc2_weights[expert], fc2_weights_blockscale[expert], fc2_weights_gs[expert]
             )
-            fc2_weights_q[expert] = nvfp4_vals
-            fc2_weights_blockscale[expert] = fp8_block_scales.reshape(
-                fc2_weights_blockscale[expert].shape
-            )
+
         return (
             fc1_weights_q,
             fc2_weights_q,
@@ -692,10 +695,120 @@ def test_trtllm_fused_moe_nvfp4(
             fc2_weights_gs,
         )
 
-    def compute_ref_output(fc1_weights_gs, fc2_weights_gs):
+    def _pad_weights(
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+    ):
+        """Pad the weights and block scale factors to the nearest multiple of 128x4.
+        The block scale factors are also swizzled.
+        """
+        _, fc1_inter_size, _ = fc1_expert_weights_fp4.shape
+        n_experts, hidden_size, inter_size = fc2_expert_weights_fp4.shape
+
+        FP4_PER_UINT8 = 2
+        # Convert the inter_size from number of uint8 elements to number of FP4 elements.
+        inter_size *= FP4_PER_UINT8  # 2 FP4 elements are packed in each uint8 element.
+
+        # Pad inter_size to be divisible by 128
+        inter_size_padded = math.ceil(inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+        fc1_inter_size_padded = (
+            math.ceil(fc1_inter_size / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+        )
+        hidden_size_padded = (
+            math.ceil(hidden_size / TRTLLM_NVFP4_COLUMN_SIZE) * TRTLLM_NVFP4_COLUMN_SIZE
+        )
+
+        inter_size_needs_padding = (is_gated_mlp and fc1_inter_size_padded != fc1_inter_size) or (
+            not is_gated_mlp and inter_size_padded != inter_size
+        )
+        hidden_size_needs_padding = hidden_size % TRTLLM_NVFP4_COLUMN_SIZE != 0
+        if inter_size_needs_padding or hidden_size_needs_padding:
+            # assert False, "See https://github.com/NVIDIA/TensorRT-LLM/issues/10331"
+            assert inter_size % NVFP4_BLOCK_SIZE == 0, (
+                f"inter_size {inter_size} must be divisible by {NVFP4_BLOCK_SIZE}"
+            )
+            # fc1_expert_weights_fp4: [E, I, H] or [E, 2*I, H]
+            # fc1_padded = fc1_expert_weights_fp4.new_zeros(
+            #     n_experts,
+            #     fc1_inter_size_padded,
+            #     hidden_size_padded // FP4_PER_UINT8,
+            # )
+            # fc1_padded[:, :fc1_inter_size, :] = fc1_expert_weights_fp4
+            fc1_padded = torch.nn.functional.pad(
+                fc1_expert_weights_fp4,
+                (
+                    0,
+                    hidden_size_padded // FP4_PER_UINT8
+                    - fc1_expert_weights_fp4.shape[2],  # pad width (last dim)
+                    0,
+                    fc1_inter_size_padded - fc1_expert_weights_fp4.shape[1],
+                ),  # pad height (second to last dim)
+            )
+
+            fc1_blockscale_fp8_padded = fc1_weight_blockscale_fp8.new_zeros(
+                n_experts, fc1_inter_size_padded, hidden_size_padded // NVFP4_BLOCK_SIZE
+            )
+            fc1_blockscale_fp8_padded[:, :fc1_inter_size, : hidden_size // NVFP4_BLOCK_SIZE] = (
+                fc1_weight_blockscale_fp8
+            )
+            # Swizzle the block scale factors.
+            fc1_blockscale_fp8_padded = torch.ops.trtllm.block_scale_interleave(
+                fc1_blockscale_fp8_padded.view(torch.uint8).contiguous()
+            ).reshape(fc1_blockscale_fp8_padded.shape)
+
+            # fc2_expert_weights_fp4: [E, H, I]
+            fc2_padded = fc2_expert_weights_fp4.new_zeros(
+                n_experts, hidden_size_padded, inter_size_padded // FP4_PER_UINT8
+            )
+            fc2_padded[:, :hidden_size, : inter_size // FP4_PER_UINT8] = fc2_expert_weights_fp4
+
+            fc2_blockscale_fp8_padded = fc2_weight_blockscale_fp8.new_zeros(
+                n_experts, hidden_size_padded, inter_size_padded // NVFP4_BLOCK_SIZE
+            )
+            fc2_blockscale_fp8_padded[:, :hidden_size, : inter_size // NVFP4_BLOCK_SIZE] = (
+                fc2_weight_blockscale_fp8
+            )
+
+            # Swizzle the block scale factors.
+            fc2_blockscale_fp8_padded = torch.ops.trtllm.block_scale_interleave(
+                fc2_blockscale_fp8_padded.view(torch.uint8).contiguous()
+            ).reshape(fc2_blockscale_fp8_padded.shape)
+
+            return (fc1_padded, fc2_padded, fc1_blockscale_fp8_padded, fc2_blockscale_fp8_padded)
+
+        # No need to pad, just swizzle the block scale factors.
+        # After swizzling the block scale factors are in a 1D tensor so we can reshape them to the original shape.
+        fc1_weight_blockscale_fp8 = torch.ops.trtllm.block_scale_interleave(
+            fc1_weight_blockscale_fp8.view(torch.uint8).contiguous()
+        ).reshape(fc1_weight_blockscale_fp8.shape)
+
+        fc2_weight_blockscale_fp8 = torch.ops.trtllm.block_scale_interleave(
+            fc2_weight_blockscale_fp8.view(torch.uint8).contiguous()
+        ).reshape(fc2_weight_blockscale_fp8.shape)
+
+        return (
+            fc1_expert_weights_fp4,
+            fc2_expert_weights_fp4,
+            fc1_weight_blockscale_fp8,
+            fc2_weight_blockscale_fp8,
+        )
+
+    def compute_ref_output(
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+        fc1_weights_gs,
+        fc2_weights_gs,
+    ):
         # Quantize then dequantize the input to emulate the precision loss.
         a_fp4, a_scale_interleaved = torch.ops.trtllm.fp4_quantize(
-            x, fc1_activation_gs, NVFP4_BLOCK_SIZE
+            x,
+            fc1_activation_gs,
+            NVFP4_BLOCK_SIZE,
+            isSfSwizzledLayout=False,
         )
         x_dq = dequantize_nvfp4_to_dtype(
             a_fp4,
@@ -704,6 +817,7 @@ def test_trtllm_fused_moe_nvfp4(
             dtype=otype,
             device=x.device,
             block_size=NVFP4_BLOCK_SIZE,
+            is_swizzled=False,
         )
         fc1_weights_dq = torch.empty(fc1_expert_weights.shape, device="cuda", dtype=otype)
         fc2_weights_dq = torch.empty(fc2_expert_weights.shape, device="cuda", dtype=otype)
@@ -758,6 +872,19 @@ def test_trtllm_fused_moe_nvfp4(
         fc2_weights_gs,
     ) = _quantize_weights(fc1_expert_weights, fc2_expert_weights, is_gated_mlp)
 
+    # The TRT-LLM MoE operator expects padded weights and block scale factors. Block scale factors are also swizzled.
+    (
+        fc1_expert_weights_fp4_padded,
+        fc2_expert_weights_fp4_padded,
+        fc1_weight_blockscale_fp8_padded,
+        fc2_weight_blockscale_fp8_padded,
+    ) = _pad_weights(
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+    )
+
     # Simplify by assuming a scale of 1.0 for the activations
     fc1_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
     fc2_activation_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
@@ -771,10 +898,10 @@ def test_trtllm_fused_moe_nvfp4(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        fc1_expert_weights_fp4,
-        fc2_expert_weights_fp4,
-        fc1_weight_blockscale_fp8,
-        fc2_weight_blockscale_fp8,
+        fc1_expert_weights_fp4_padded,
+        fc2_expert_weights_fp4_padded,
+        fc1_weight_blockscale_fp8_padded,
+        fc2_weight_blockscale_fp8_padded,
         fc1_activation_gs,
         fc2_activation_gs,
         fc1_alpha,
@@ -783,12 +910,19 @@ def test_trtllm_fused_moe_nvfp4(
         act_fn=activation_func,
     )
 
-    ref_output = compute_ref_output(fc1_weights_gs, fc2_weights_gs)
+    # Compute the reference using the unpadded weights and block scale factors
+    ref_output = compute_ref_output(
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+        fc1_weights_gs,
+        fc2_weights_gs,
+    )
+
     diff = ref_output - trtllm_output
     print(f"max diff: {diff.abs().max()}")
-    # torch.set_printoptions(profile="full")
     print(f"{diff=}")
     print(f"{ref_output=}")
     print(f"{trtllm_output=}")
-    # print(f"{diff.abs()>=2e-1=}")
-    torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-1, atol=2e-1)
+    torch.testing.assert_close(ref_output, trtllm_output, rtol=2e-2, atol=2e-1)
